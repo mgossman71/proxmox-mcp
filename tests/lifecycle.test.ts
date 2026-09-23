@@ -1,0 +1,164 @@
+import { describe, it, expect, vi, beforeEach } from "vitest";
+
+vi.mock("../src/proxmox.js", () => ({
+  pvesh: vi.fn(),
+  getGuestInfo: vi.fn(),
+  waitForTask: vi.fn(),
+  getNextVmid: vi.fn(),
+  generateMac: vi.fn(() => "BC:24:11:AA:BB:CC"),
+  ProxmoxError: class ProxmoxError extends Error {
+    constructor(message: string, public exitCode = 1, public stderr = "") {
+      super(message);
+      this.name = "ProxmoxError";
+    }
+  },
+}));
+
+import { pvesh, getGuestInfo, waitForTask } from "../src/proxmox.js";
+import { registerLifecycleTools } from "../src/tools/lifecycle.js";
+
+const mockPvesh = vi.mocked(pvesh);
+const mockGetGuestInfo = vi.mocked(getGuestInfo);
+const mockWaitForTask = vi.mocked(waitForTask);
+
+function createMockServer() {
+  const tools: Record<string, any> = {};
+  return {
+    tools,
+    registerTool(name: string, _meta: any, handler: any) {
+      tools[name] = handler;
+    },
+  } as any;
+}
+
+beforeEach(() => {
+  vi.resetAllMocks();
+});
+
+describe("lifecycle tools", () => {
+  let server: any;
+  beforeEach(() => {
+    server = createMockServer();
+    registerLifecycleTools(server);
+  });
+
+  it("should register all 6 lifecycle tools", () => {
+    expect(Object.keys(server.tools).sort()).toEqual([
+      "reboot_guest",
+      "resume_guest",
+      "shutdown_guest",
+      "start_guest",
+      "stop_guest",
+      "suspend_guest",
+    ]);
+  });
+
+  describe("resolveGuestPath (via start_guest)", () => {
+    it("should find QEMU VM on specified node", async () => {
+      mockPvesh.mockResolvedValueOnce({ status: "stopped" }); // qemu status check
+      mockWaitForTask.mockResolvedValue(undefined);
+
+      await server.tools["start_guest"]({ node: "pve", vmid: 100 });
+      expect(mockPvesh).toHaveBeenCalledWith("get", "/nodes/pve/qemu/100/status/current");
+      expect(mockPvesh).toHaveBeenCalledWith("create", "/nodes/pve/qemu/100/status/start", {}, 120000);
+      expect(mockWaitForTask).toHaveBeenCalledWith("pve", undefined);
+    });
+
+    it("should find LXC when QEMU fails", async () => {
+      mockPvesh
+        .mockRejectedValueOnce(new Error("not found")) // qemu check
+        .mockResolvedValueOnce({ status: "stopped" }); // lxc check
+      mockWaitForTask.mockResolvedValue(undefined);
+
+      await server.tools["start_guest"]({ node: "pve", vmid: 101 });
+      expect(mockPvesh).toHaveBeenCalledWith("get", "/nodes/pve/lxc/101/status/current");
+      expect(mockPvesh).toHaveBeenCalledWith("create", "/nodes/pve/lxc/101/status/start", {}, 120000);
+    });
+
+    it("should fall back to cluster search", async () => {
+      mockPvesh
+        .mockRejectedValueOnce(new Error("nf")) // qemu on pve
+        .mockRejectedValueOnce(new Error("nf")) // lxc on pve
+        .mockResolvedValueOnce([ // cluster resources
+          { vmid: 200, type: "qemu", name: "Remote", node: "node2" },
+        ]);
+      mockWaitForTask.mockResolvedValue(undefined);
+
+      await server.tools["start_guest"]({ node: "pve", vmid: 200 });
+      expect(mockPvesh).toHaveBeenCalledWith("get", "/cluster/resources");
+      expect(mockPvesh).toHaveBeenCalledWith("create", "/nodes/node2/qemu/200/status/start", {}, 120000);
+    });
+
+    it("should fall back to cluster search finding LXC", async () => {
+      mockPvesh
+        .mockRejectedValueOnce(new Error("nf")) // qemu on pve
+        .mockRejectedValueOnce(new Error("nf")) // lxc on pve
+        .mockResolvedValueOnce([ // cluster resources
+          { vmid: 201, type: "lxc", name: "RemoteCT", node: "node3" },
+        ]);
+      mockWaitForTask.mockResolvedValue(undefined);
+
+      await server.tools["start_guest"]({ node: "pve", vmid: 201 });
+      expect(mockPvesh).toHaveBeenCalledWith("create", "/nodes/node3/lxc/201/status/start", {}, 120000);
+    });
+
+    it("should throw when guest not found in cluster", async () => {
+      mockPvesh
+        .mockRejectedValueOnce(new Error("nf"))
+        .mockRejectedValueOnce(new Error("nf"))
+        .mockResolvedValueOnce([
+          { vmid: 100, type: "qemu", name: "Other", node: "pve" },
+        ]);
+
+      await expect(server.tools["start_guest"]({ node: "pve", vmid: 999 })).rejects.toThrow(
+        "Guest with VMID 999 not found in cluster"
+      );
+    });
+  });
+
+  describe("each action", () => {
+    const actions: [string, string][] = [
+      ["start_guest", "start"],
+      ["stop_guest", "stop"],
+      ["shutdown_guest", "shutdown"],
+      ["reboot_guest", "restart"],
+      ["suspend_guest", "suspend"],
+      ["resume_guest", "resume"],
+    ];
+
+    for (const [toolName, action] of actions) {
+      it(`${toolName} should call ${action} and wait for task`, async () => {
+        mockPvesh
+          .mockResolvedValueOnce({ status: "running" }) // resolve guest path
+          .mockResolvedValueOnce("UPID:pve:123:456:789:" + action);
+        mockWaitForTask.mockResolvedValue(undefined);
+
+        const result = await server.tools[toolName]({ node: "pve", vmid: 100 });
+        expect(mockPvesh).toHaveBeenCalledWith("create", `/nodes/pve/qemu/100/status/${action}`, {}, 120000);
+        expect(mockWaitForTask).toHaveBeenCalledWith("pve", "UPID:pve:123:456:789:" + action);
+        expect(result.content[0].text).toContain("VMID 100");
+      });
+
+      it(`${toolName} should propagate task errors`, async () => {
+        mockPvesh
+          .mockResolvedValueOnce({ status: "running" })
+          .mockResolvedValueOnce("UPID:pve:123:456:789:" + action);
+        mockWaitForTask.mockRejectedValue(new Error("task failed: disk full"));
+
+        await expect(server.tools[toolName]({ node: "pve", vmid: 100 })).rejects.toThrow("task failed");
+      });
+    }
+  });
+
+  describe("return message", () => {
+    it("should include a helpful hint", async () => {
+      mockPvesh
+        .mockResolvedValueOnce({ status: "stopped" })
+        .mockResolvedValueOnce(null);
+      mockWaitForTask.mockResolvedValue(undefined);
+
+      const result = await server.tools["start_guest"]({ node: "pve", vmid: 100 });
+      expect(result.content[0].text).toContain("Use get_guest_status to verify");
+    });
+  });
+});

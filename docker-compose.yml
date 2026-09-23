@@ -1,0 +1,14 @@
+services:
+  proxmox-mcp:
+    build: .
+    container_name: proxmox-mcp
+    ports:
+      - "3040:3000"
+    volumes:
+      - ~/.ssh/id_rsa:/secrets/id_rsa:ro
+    environment:
+      PROXMOX_SSH_HOST: ${PROXMOX_SSH_HOST:-10.0.0.19}
+      PROXMOX_SSH_USER: ${PROXMOX_SSH_USER:-root}
+      PROXMOX_SSH_KEY: /secrets/id_rsa
+      MCP_PORT: 3000
+    restart: unless-stopped
