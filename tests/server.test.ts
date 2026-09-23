@@ -23,7 +23,7 @@ describe("createServer", () => {
     expect(server.connect).toBeDefined();
   });
 
-  it("should have all 26 tools registered", () => {
+  it("should have all 23 tools registered", () => {
     const server: any = createServer();
     // McpServer stores registered tools internally; we verify by
     // checking the server has the expected interface

@@ -82,6 +82,8 @@ curl http://localhost:3000/health
 
 ## Tools
 
+> **Scope note:** All lifecycle and power operations target **guests** (QEMU VMs or LXC containers) only. This server does **not** expose physical host power management (node shutdown/reboot) or destructive guest deletion operations.
+
 ### Inspection
 | Tool | Description |
 |------|-------------|
@@ -112,8 +114,6 @@ curl http://localhost:3000/health
 |------|-------------|
 | `list_snapshots` | List snapshots |
 | `create_snapshot` | Create a snapshot |
-| `revert_snapshot` | Revert to a snapshot |
-| `delete_snapshot` | Delete a snapshot |
 
 ### Provisioning
 | Tool | Description |
@@ -121,8 +121,7 @@ curl http://localhost:3000/health
 | `create_vm` | Create a QEMU VM from an ISO |
 | `create_container` | Create an LXC container from a template |
 | `clone_guest` | Clone a VM or container |
-| `delete_guest` | Delete a VM or container |
-| `set_guest_config` | Modify VM/container settings (CPU, RAM, disk, etc.) |
+| `set_guest_config` | Modify VM/container settings (CPU, memory, swap (LXC), name, onboot) |
 
 ## Development
 
