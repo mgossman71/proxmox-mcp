@@ -30,11 +30,8 @@ ssh-copy-id root@<proxmox-ip>
 
 ### 2. Configure
 
-Copy the env template and edit:
+Create a .env file with your Proxmox SSH details (required — the app will not start without PROXMOX_SSH_HOST):
 
-```bash
-cp .env.example .env
-```
 
 ```env
 PROXMOX_SSH_HOST=10.0.0.19

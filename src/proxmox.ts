@@ -4,7 +4,7 @@ import os from "os";
 
 const execFileAsync = promisify(execFile);
 
-const SSH_HOST = process.env.PROXMOX_SSH_HOST || "10.0.0.19";
+const SSH_HOST = process.env.PROXMOX_SSH_HOST;
 const SSH_USER = process.env.PROXMOX_SSH_USER || "root";
 const SSH_KEY = expandHome(
   process.env.PROXMOX_SSH_KEY || "~/.ssh/id_rsa"
