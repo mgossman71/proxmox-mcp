@@ -117,7 +117,7 @@ describe("migration tools", () => {
       });
 
       expect(mockPvesh).toHaveBeenCalledWith(
-        "set",
+        "create",
         "/nodes/pve/lxc/200/move",
         { target: "node2", replicate: 1 },
         600000
