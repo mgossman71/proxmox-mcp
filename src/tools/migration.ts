@@ -78,7 +78,7 @@ async function performMigration(
     if (targetStorage) params.target_storage = targetStorage;
     const result = await pvesh(
       "create",
-      `/nodes/${node}/lxc/${vmid}/move`,
+      `/nodes/${node}/lxc/${vmid}/migrate`,
       params,
       600000
     );

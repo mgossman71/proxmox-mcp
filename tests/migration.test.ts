@@ -119,7 +119,7 @@ describe("migration tools", () => {
 
       expect(mockPvesh).toHaveBeenCalledWith(
         "create",
-        "/nodes/pve/lxc/200/move",
+        "/nodes/pve/lxc/200/migrate",
         { target: "node2", replicate: 1 },
         600000
       );
@@ -132,7 +132,7 @@ describe("migration tools", () => {
         .mockResolvedValueOnce({ status: "running" })          // resolveGuest: lxc check
         .mockResolvedValueOnce({ tags: "" })                   // getGuestTags: config (no tags)
         .mockRejectedValueOnce(new Error(                     // move endpoint: not available
-          "No 'create' handler defined for '/nodes/pve/lxc/200/move'"
+          "No 'create' handler defined for '/nodes/pve/lxc/200/migrate'"
         ))
         .mockResolvedValueOnce({ hostname: "myct", tags: "" }) // config read for clone fallback
         .mockResolvedValueOnce("UPID:pve:1:clone")            // clone task
