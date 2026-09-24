@@ -184,7 +184,7 @@ describe("migration tools", () => {
     it("should refuse if guest is tagged dont-move", async () => {
       mockPvesh
         .mockResolvedValueOnce({ status: "running" })  // resolveGuest: qemu
-        .mockResolvedValueOnce({ tags: "web,dont-move" }); // config with dont-move
+        .mockResolvedValueOnce({ tags: "web;dont-move" }); // config with dont-move
 
       await expect(
         server.tools["migrate_guest"]({

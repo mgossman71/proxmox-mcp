@@ -37,7 +37,7 @@ async function getGuestTags(
   }
   const tags: string = config.tags ?? "";
   if (!tags) return [];
-  return tags.split(",").map((t) => t.trim()).filter(Boolean);
+  return tags.split(/[;,]/).map((t) => t.trim()).filter(Boolean);
 }
 
 /**
