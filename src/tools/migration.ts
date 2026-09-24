@@ -73,7 +73,8 @@ async function performMigration(
   try {
     const params: Record<string, string | number | boolean> = {
       target,
-      replicate: 1,
+      online: 1,
+      bwlimit: (bandwidth ?? 150) * 1024,
     };
     if (targetStorage) params.target_storage = targetStorage;
     const result = await pvesh(

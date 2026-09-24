@@ -120,7 +120,7 @@ describe("migration tools", () => {
       expect(mockPvesh).toHaveBeenCalledWith(
         "create",
         "/nodes/pve/lxc/200/migrate",
-        { target: "node2", replicate: 1 },
+        { target: "node2", online: 1, bwlimit: 153600 },
         600000
       );
       expect(result.content[0].text).toContain("Migrated lxc VMID 200");
