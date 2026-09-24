@@ -1,8 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { pvesh, getNextVmid, generateMac, getGuestInfo, ProxmoxError, waitForTask } from "../proxmox.js";
-
-const nodeParam = z.string().default("pve").describe("Proxmox node name");
+import { pvesh, getNextVmid, generateMac, getGuestInfo, ProxmoxError, waitForTask, asString } from "../proxmox.js";
+import { nodeParam, storageParam } from "../schemas.js";
 
 export function registerProvisioningTools(server: McpServer): void {
   // create_vm
@@ -21,7 +20,7 @@ export function registerProvisioningTools(server: McpServer): void {
         cores: z.number().optional().describe("Cores per socket (defaults to cpus/sockets)"),
         memory: z.number().default(4096).describe("Memory in MB"),
         disk: z.number().default(32).describe("Disk size in GB"),
-        storage: z.string().default("local-lvm").describe("Storage pool for the disk"),
+        storage: storageParam.default("local-lvm").describe("Storage pool for the disk"),
         iso: z.string().describe("ISO volid to boot from (e.g. 'local:iso/ubuntu-24.04.4-live-server-amd64.iso'). Use list_isos to find available ISOs."),
         ostype: z.string().default("l26").describe("OS type: l26 (Linux 2.6+), l26-kvm, s26 (Solaris), w2k3 (Win XP/2003), w2k8 (Win 2008), wwin7 (Win 7/2008R2), wwin8 (Win 8/2012), wwin10 (Win 10/2016+), wwin11 (Win 11/2022+), netbsd, ofreebsd, ofreebsd10, openbsd"),
         bridge: z.string().default("vmbr0").describe("Network bridge to attach"),
@@ -55,7 +54,7 @@ export function registerProvisioningTools(server: McpServer): void {
       };
 
       const result = await pvesh("create", `/nodes/${node}/qemu`, params, 120000);
-      await waitForTask(node, result);
+      await waitForTask(node, asString(result));
 
       return {
         content: [
@@ -90,7 +89,7 @@ export function registerProvisioningTools(server: McpServer): void {
         memory: z.number().default(1024).describe("Memory in MB (minimum 128)"),
         swap: z.number().default(512).describe("Swap in MB"),
         disk: z.number().default(8).describe("Root filesystem size in GB"),
-        storage: z.string().default("local-lvm").describe("Storage pool for the rootfs"),
+        storage: storageParam.default("local-lvm").describe("Storage pool for the rootfs"),
         bridge: z.string().default("vmbr0").describe("Network bridge to attach"),
         unprivileged: z.boolean().default(true).describe("Run as unprivileged container (recommended for security)"),
         onboot: z.boolean().default(true).describe("Start container automatically when the host boots"),
@@ -119,7 +118,7 @@ export function registerProvisioningTools(server: McpServer): void {
       if (description) params.description = description;
 
       const result = await pvesh("create", `/nodes/${node}/lxc`, params, 120000);
-      await waitForTask(node, result);
+      await waitForTask(node, asString(result));
 
       return {
         content: [
@@ -170,12 +169,12 @@ export function registerProvisioningTools(server: McpServer): void {
       if (info.type === "qemu") {
         if (!full) params.snapshot = "current";
         const result = await pvesh("create", `/nodes/${node}/qemu/${vmid}/clone`, params, 300000);
-        await waitForTask(target, result);
+        await waitForTask(target, asString(result));
       } else {
         // LXC clone
         if (!full) params.snapshot = "current";
         const result = await pvesh("create", `/nodes/${node}/lxc/${vmid}/clone`, params, 300000);
-        await waitForTask(target, result);
+        await waitForTask(target, asString(result));
       }
 
       return {
@@ -228,7 +227,7 @@ export function registerProvisioningTools(server: McpServer): void {
       }
 
       const result = await pvesh("set", basePath, params, 120000);
-      await waitForTask(info.node, result);
+      await waitForTask(info.node, asString(result));
 
       const changes = Object.entries(params)
         .map(([k, v]) => `  ${k}: ${v}`)

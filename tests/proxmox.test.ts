@@ -260,12 +260,16 @@ describe("generateMac", () => {
     expect(macs.size).toBeGreaterThan(90); // allow tiny collision probability
   });
 
-  it("should have locally administered bit set (second octet even)", () => {
+  it("should have locally administered bit set in first dynamic octet", () => {
     for (let i = 0; i < 50; i++) {
       const mac = generateMac();
       const parts = mac.split(":");
-      const secondOctet = parseInt(parts[1], 16);
-      expect(secondOctet % 2).toBe(0);
+      // parts[3] is the first dynamically generated octet (prefix is BC:24:11:XX:XX:XX)
+      const firstDynamicOctet = parseInt(parts[3], 16);
+      // Locally administered bit is bit 1 (0x02)
+      expect(firstDynamicOctet & 0x02).toBe(0x02);
+      // Unicast bit is bit 0 (0x01) — should be 0
+      expect(firstDynamicOctet & 0x01).toBe(0);
     }
   });
 });

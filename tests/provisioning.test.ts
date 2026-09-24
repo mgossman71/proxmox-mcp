@@ -1,18 +1,47 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
+vi.mock("../src/proxmox.js", () => {
+  const pvesh = vi.fn();
+  const getGuestInfo = vi.fn();
 
-vi.mock("../src/proxmox.js", () => ({
-  pvesh: vi.fn(),
-  getGuestInfo: vi.fn(),
-  waitForTask: vi.fn(),
-  getNextVmid: vi.fn(),
-  generateMac: vi.fn(() => "BC:24:11:AA:BB:CC"),
-  ProxmoxError: class ProxmoxError extends Error {
-    constructor(message: string, public exitCode = 1, public stderr = "") {
+  class ProxmoxError extends Error {
+    exitCode: number;
+    stderr: string;
+    constructor(message: string, exitCode = 1, stderr = "") {
       super(message);
       this.name = "ProxmoxError";
+      this.exitCode = exitCode;
+      this.stderr = stderr;
     }
-  },
-}));
+  }
+
+  async function resolveGuest(node: string, vmid: number) {
+    try {
+      await pvesh("get", `/nodes/${node}/qemu/${vmid}/status/current`);
+      return { node, type: "qemu" as const };
+    } catch { /* not qemu */ }
+    try {
+      await pvesh("get", `/nodes/${node}/lxc/${vmid}/status/current`);
+      return { node, type: "lxc" as const };
+    } catch { /* not lxc */ }
+    const info = await getGuestInfo(vmid);
+    return { node: info.node, type: info.type };
+  }
+
+  return {
+    pvesh,
+    getGuestInfo,
+    resolveGuest,
+    waitForTask: vi.fn(),
+    getNextVmid: vi.fn(),
+    generateMac: vi.fn(() => "BC:24:11:AA:BB:CC"),
+    asString: (v: any) => (typeof v === "string" ? v : null),
+    asObject: (v: any) => (typeof v === "object" && v !== null && !Array.isArray(v) ? v : null),
+    ProxmoxError,
+    ProxmoxParseError: class ProxmoxParseError extends ProxmoxError {
+      constructor(message: string) { super(message); this.name = "ProxmoxParseError"; }
+    },
+  };
+});
 
 import { pvesh, getGuestInfo, waitForTask, getNextVmid, generateMac, ProxmoxError } from "../src/proxmox.js";
 import { registerProvisioningTools } from "../src/tools/provisioning.js";

@@ -1,8 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { pvesh, getGuestInfo } from "../proxmox.js";
-
-const nodeParam = z.string().default("pve").describe("Proxmox node name");
+import { pvesh, resolveGuest, ProxmoxError } from "../proxmox.js";
+import { nodeParam, storageParam, vmidParam } from "../schemas.js";
 
 export function registerInspectionTools(server: McpServer): void {
   // list_nodes
@@ -72,30 +71,13 @@ export function registerInspectionTools(server: McpServer): void {
         "Get the live status of a VM or container (auto-detects type). Returns CPU, memory, disk, network, uptime, and power state.",
       inputSchema: {
         node: nodeParam,
-        vmid: z.number().describe("VM or container ID"),
+        vmid: vmidParam,
       },
     },
     async ({ node, vmid }) => {
-      // Try to use provided node, but verify the guest exists there
-      let guestNode = node;
-      let type: string;
-      try {
-        const data = await pvesh("get", `/nodes/${node}/qemu/${vmid}/status/current`);
-        type = "qemu";
-        return { content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }] };
-      } catch {
-        // fall through to LXC
-      }
-      try {
-        const data = await pvesh("get", `/nodes/${node}/lxc/${vmid}/status/current`);
-        type = "lxc";
-        return { content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }] };
-      } catch (e: any) {
-        // Guest not found on this node, try auto-detect
-        const info = await getGuestInfo(vmid);
-        const data = await pvesh("get", `/nodes/${info.node}/${info.type}/${vmid}/status/current`);
-        return { content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }] };
-      }
+      const { node: guestNode, type } = await resolveGuest(node, vmid);
+      const data = await pvesh("get", `/nodes/${guestNode}/${type}/${vmid}/status/current`);
+      return { content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }] };
     }
   );
 
@@ -108,24 +90,13 @@ export function registerInspectionTools(server: McpServer): void {
         "Get the full configuration of a VM or container (auto-detects type). Returns disks, network, CPU, memory, boot order, and all settings.",
       inputSchema: {
         node: nodeParam,
-        vmid: z.number().describe("VM or container ID"),
+        vmid: vmidParam,
       },
     },
     async ({ node, vmid }) => {
-      try {
-        const data = await pvesh("get", `/nodes/${node}/qemu/${vmid}/config`);
-        return { content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }] };
-      } catch {
-        // fall through
-      }
-      try {
-        const data = await pvesh("get", `/nodes/${node}/lxc/${vmid}/config`);
-        return { content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }] };
-      } catch {
-        const info = await getGuestInfo(vmid);
-        const data = await pvesh("get", `/nodes/${info.node}/${info.type}/${vmid}/config`);
-        return { content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }] };
-      }
+      const { node: guestNode, type } = await resolveGuest(node, vmid);
+      const data = await pvesh("get", `/nodes/${guestNode}/${type}/${vmid}/config`);
+      return { content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }] };
     }
   );
 
@@ -152,7 +123,7 @@ export function registerInspectionTools(server: McpServer): void {
         "List files and images in a storage pool (ISOs, disk images, LXC templates, backups).",
       inputSchema: {
         node: nodeParam,
-        storage: z.string().describe("Storage pool name (e.g. 'local', 'local-lvm')"),
+        storage: storageParam,
       },
     },
     async ({ node, storage }) => {
@@ -172,12 +143,17 @@ export function registerInspectionTools(server: McpServer): void {
     },
     async ({ node }) => {
       const storages = await pvesh("get", `/nodes/${node}/storage`);
+      if (!Array.isArray(storages)) {
+        throw new ProxmoxError("Unexpected (non-array) response from /nodes/{node}/storage");
+      }
       const isos: any[] = [];
       for (const s of storages) {
         try {
           const content = await pvesh("get", `/nodes/${node}/storage/${s.storage}/content`);
-          const isoFiles = content.filter((c: any) => c.content === "iso");
-          isos.push(...isoFiles);
+          if (Array.isArray(content)) {
+            const isoFiles = content.filter((c: any) => c.content === "iso");
+            isos.push(...isoFiles);
+          }
         } catch {
           // storage may not support content listing
         }
@@ -197,12 +173,17 @@ export function registerInspectionTools(server: McpServer): void {
     },
     async ({ node }) => {
       const storages = await pvesh("get", `/nodes/${node}/storage`);
+      if (!Array.isArray(storages)) {
+        throw new ProxmoxError("Unexpected (non-array) response from /nodes/{node}/storage");
+      }
       const templates: any[] = [];
       for (const s of storages) {
         try {
           const content = await pvesh("get", `/nodes/${node}/storage/${s.storage}/content`);
-          const tmplFiles = content.filter((c: any) => c.content === "vztmpl");
-          templates.push(...tmplFiles);
+          if (Array.isArray(content)) {
+            const tmplFiles = content.filter((c: any) => c.content === "vztmpl");
+            templates.push(...tmplFiles);
+          }
         } catch {
           // skip
         }

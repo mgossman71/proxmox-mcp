@@ -3,8 +3,12 @@ import express from "express";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { createServer } from "./server.js";
+import { bearerAuth } from "./auth.js";
 
 const PORT = parseInt(process.env.MCP_PORT || "3000", 10);
+// Shared-secret auth for /mcp. When unset, requests are allowed (a warning is
+// logged at startup) so local development stays frictionless.
+const MCP_AUTH_TOKEN = process.env.MCP_AUTH_TOKEN;
 
 const app = express();
 app.use(express.json());
@@ -20,13 +24,13 @@ async function handleSession(
   await server.connect(transport);
 }
 
-// Health check
+// Health check (left open so orchestrators can probe it without credentials)
 app.get("/health", (_req, res) => {
   res.json({ status: "ok", service: "proxmox-mcp" });
 });
 
 // MCP Streamable HTTP endpoint
-app.all("/mcp", async (req, res) => {
+app.all("/mcp", bearerAuth(MCP_AUTH_TOKEN), async (req, res) => {
   const sessionId = req.headers["mcp-session-id"] as string | undefined;
 
   try {
@@ -81,6 +85,17 @@ app.listen(PORT, () => {
   console.log(`  MCP endpoint:   http://0.0.0.0:${PORT}/mcp`);
   console.log(`  Health check:   http://0.0.0.0:${PORT}/health`);
   console.log(`  SSH target:     ${process.env.PROXMOX_SSH_USER || "root"}@${process.env.PROXMOX_SSH_HOST || "10.0.0.19"}`);
+  // Fail-loud about missing configuration instead of silently guessing.
+  if (!process.env.PROXMOX_SSH_HOST) {
+    console.warn(
+      "  ⚠ PROXMOX_SSH_HOST is not set; defaulting to 10.0.0.19"
+    );
+  }
+  if (!MCP_AUTH_TOKEN) {
+    console.warn(
+      "  ⚠ MCP_AUTH_TOKEN is not set; the /mcp endpoint is UNAUTHENTICATED. Set MCP_AUTH_TOKEN to require a Bearer token."
+    );
+  }
 });
 
 // Cleanup on shutdown

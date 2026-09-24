@@ -1,19 +1,49 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
 // Mock the proxmox module
-vi.mock("../src/proxmox.js", () => ({
-  pvesh: vi.fn(),
-  getGuestInfo: vi.fn(),
-  waitForTask: vi.fn(),
-  getNextVmid: vi.fn(),
-  generateMac: vi.fn(() => "BC:24:11:AA:BB:CC"),
-  ProxmoxError: class ProxmoxError extends Error {
-    constructor(message: string, public exitCode = 1, public stderr = "") {
+vi.mock("../src/proxmox.js", () => {
+  const pvesh = vi.fn();
+  const getGuestInfo = vi.fn();
+
+  class ProxmoxError extends Error {
+    exitCode: number;
+    stderr: string;
+    constructor(message: string, exitCode = 1, stderr = "") {
       super(message);
       this.name = "ProxmoxError";
+      this.exitCode = exitCode;
+      this.stderr = stderr;
     }
-  },
-}));
+  }
+
+  async function resolveGuest(node: string, vmid: number) {
+    try {
+      await pvesh("get", `/nodes/${node}/qemu/${vmid}/status/current`);
+      return { node, type: "qemu" as const };
+    } catch { /* not qemu */ }
+    try {
+      await pvesh("get", `/nodes/${node}/lxc/${vmid}/status/current`);
+      return { node, type: "lxc" as const };
+    } catch { /* not lxc */ }
+    const info = await getGuestInfo(vmid);
+    return { node: info.node, type: info.type };
+  }
+
+  return {
+    pvesh,
+    getGuestInfo,
+    resolveGuest,
+    waitForTask: vi.fn(),
+    getNextVmid: vi.fn(),
+    generateMac: vi.fn(() => "BC:24:11:AA:BB:CC"),
+    asString: (v: any) => (typeof v === "string" ? v : null),
+    asObject: (v: any) => (typeof v === "object" && v !== null && !Array.isArray(v) ? v : null),
+    ProxmoxError,
+    ProxmoxParseError: class ProxmoxParseError extends ProxmoxError {
+      constructor(message: string) { super(message); this.name = "ProxmoxParseError"; }
+    },
+  };
+});
 
 import { pvesh, getGuestInfo } from "../src/proxmox.js";
 import { registerInspectionTools } from "../src/tools/inspection.js";
@@ -34,6 +64,13 @@ function createMockServer() {
 
 beforeEach(() => {
   vi.resetAllMocks();
+  mockGetGuestInfo.mockImplementation(async (vmid: number) => {
+    const resources = await mockPvesh("get", "/cluster/resources");
+    if (!Array.isArray(resources)) throw new Error("Unexpected (non-array) response from /cluster/resources");
+    const match = (resources as any[]).find((r: any) => r.vmid === vmid && (r.type === "qemu" || r.type === "lxc"));
+    if (!match) throw new Error(`VMID ${vmid} not found in cluster`);
+    return { node: match.node, type: match.type, name: match.name };
+  });
 });
 
 describe("inspection tools", () => {
@@ -43,7 +80,7 @@ describe("inspection tools", () => {
     registerInspectionTools(server);
   });
 
-  it("should register all 12 inspection tools", () => {
+  it("should register all 11 inspection tools", () => {
     expect(Object.keys(server.tools).sort()).toEqual([
       "get_guest_config",
       "get_guest_status",
@@ -131,7 +168,8 @@ describe("inspection tools", () => {
     it("should fall back to LXC when QEMU fails", async () => {
       const data = { status: "running" };
       mockPvesh.mockRejectedValueOnce(new Error("not found"));
-      mockPvesh.mockResolvedValueOnce(data);
+      mockPvesh.mockResolvedValueOnce(data); // resolveGuest LXC check
+      mockPvesh.mockResolvedValueOnce(data); // actual status fetch
       const result = await server.tools["get_guest_status"]({ node: "pve", vmid: 101 });
       expect(mockPvesh).toHaveBeenCalledWith("get", "/nodes/pve/qemu/101/status/current");
       expect(mockPvesh).toHaveBeenCalledWith("get", "/nodes/pve/lxc/101/status/current");
@@ -171,7 +209,8 @@ describe("inspection tools", () => {
     it("should fall back to LXC when QEMU fails", async () => {
       const data = { hostname: "CT1" };
       mockPvesh.mockRejectedValueOnce(new Error("not found"));
-      mockPvesh.mockResolvedValueOnce(data);
+      mockPvesh.mockResolvedValueOnce(data); // resolveGuest LXC check
+      mockPvesh.mockResolvedValueOnce(data); // actual config fetch
       const result = await server.tools["get_guest_config"]({ node: "pve", vmid: 101 });
       expect(mockPvesh).toHaveBeenCalledWith("get", "/nodes/pve/lxc/101/config");
       expect(result.content[0].text).toContain('"hostname": "CT1"');
