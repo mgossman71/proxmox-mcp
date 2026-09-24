@@ -195,6 +195,20 @@ describe("migration tools", () => {
       ).rejects.toThrow('tagged "dont-move"');
     });
 
+    it("should refuse migration if config read returns null (fail-closed)", async () => {
+      mockPvesh
+        .mockResolvedValueOnce({ status: "running" })  // resolveGuest: qemu
+        .mockResolvedValueOnce(null);                  // getGuestTags: config returns null
+
+      await expect(
+        server.tools["migrate_guest"]({
+          node: "pve",
+          vmid: 106,
+          target_node: "node2",
+        })
+      ).rejects.toThrow("Cannot verify tags");
+    });
+
     it("should pass bandwidth parameter for QEMU", async () => {
       mockPvesh
         .mockResolvedValueOnce({ status: "running" })  // resolveGuest
@@ -279,6 +293,24 @@ describe("migration tools", () => {
       });
 
       expect(result.content[0].text).toContain("has no guests to drain");
+    });
+
+    it("should report failed migration when config read returns null (fail-closed)", async () => {
+      mockPvesh
+        .mockResolvedValueOnce([
+          { vmid: 100, name: "web", status: "running" },
+        ])
+        .mockResolvedValueOnce([]) // no lxc
+        .mockResolvedValueOnce(null); // config read for vmid 100 returns null
+
+      const result = await server.tools["drain_node"]({
+        source_node: "pve",
+        target_node: "node2",
+      });
+
+      const text = result.content[0].text;
+      expect(text).toContain("Failed: 1");
+      expect(text).toContain("Cannot verify tags");
     });
 
     it("should migrate all guests and report summary", async () => {

@@ -27,10 +27,15 @@ async function getGuestTags(
   type: "qemu" | "lxc",
   vmid: number
 ): Promise<string[]> {
-  const config = asObject(
-    await pvesh("get", `/nodes/${node}/${type}/${vmid}/config`)
-  );
-  const tags: string = config?.tags ?? "";
+  const raw = await pvesh("get", `/nodes/${node}/${type}/${vmid}/config`);
+  const config = asObject(raw);
+  if (!config) {
+    throw new ProxmoxError(
+      `Cannot verify tags for VMID ${vmid}: config read returned empty/null. ` +
+        `Refusing to proceed (fail-closed).`
+    );
+  }
+  const tags: string = config.tags ?? "";
   if (!tags) return [];
   return tags.split(",").map((t) => t.trim()).filter(Boolean);
 }
@@ -300,13 +305,18 @@ export function registerMigrationTools(server: McpServer): void {
       // Check tags for each guest
       const toMigrate: typeof guests = [];
       const skipped: { vmid: number; type: string; name: string; reason: string }[] = [];
+      const failed: { vmid: number; name: string; error: string }[] = [];
 
       for (const g of guests) {
-        const tags = await getGuestTags(source_node, g.type, g.vmid);
-        if (tags.includes(DONT_MOVE_TAG)) {
-          skipped.push({ ...g, reason: "tagged 'dont-move'" });
-        } else {
-          toMigrate.push(g);
+        try {
+          const tags = await getGuestTags(source_node, g.type, g.vmid);
+          if (tags.includes(DONT_MOVE_TAG)) {
+            skipped.push({ ...g, reason: "tagged 'dont-move'" });
+          } else {
+            toMigrate.push(g);
+          }
+        } catch (err) {
+          failed.push({ vmid: g.vmid, name: g.name, error: errMsg(err) });
         }
       }
 
@@ -338,7 +348,6 @@ export function registerMigrationTools(server: McpServer): void {
 
       // Perform migrations sequentially
       const migrated: string[] = [];
-      const failed: { vmid: number; name: string; error: string }[] = [];
 
       for (const g of toMigrate) {
         try {
