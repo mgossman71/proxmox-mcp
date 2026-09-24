@@ -75,8 +75,8 @@ async function performMigration(
   if (type === "qemu") {
     const params: Record<string, string | number | boolean> = {
       target,
-      bandwidth: bandwidth ?? 150,
-      online: 1,
+      bwlimit: bandwidth ?? 150,
+      online: online === false ? 0 : 1,
     };
     if (targetStorage) params.target_storage = targetStorage;
     const result = await pvesh(

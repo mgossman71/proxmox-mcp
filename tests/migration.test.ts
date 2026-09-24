@@ -95,7 +95,7 @@ describe("migration tools", () => {
       expect(mockPvesh).toHaveBeenCalledWith(
         "create",
         "/nodes/pve/qemu/100/migrate",
-        { target: "node2", bandwidth: 150, online: 1 },
+        { target: "node2", bwlimit: 150, online: 1 },
         600000
       );
       expect(mockWaitForTask).toHaveBeenCalledWith("pve", "UPID:pve:123:456:migrate", 600000);
@@ -226,7 +226,7 @@ describe("migration tools", () => {
       expect(mockPvesh).toHaveBeenCalledWith(
         "create",
         "/nodes/pve/qemu/100/migrate",
-        { target: "node2", bandwidth: 200, online: 1 },
+        { target: "node2", bwlimit: 200, online: 1 },
         600000
       );
     });
@@ -248,7 +248,7 @@ describe("migration tools", () => {
       expect(mockPvesh).toHaveBeenCalledWith(
         "create",
         "/nodes/pve/qemu/100/migrate",
-        { target: "node2", bandwidth: 150, online: 1, target_storage: "ceph-pool" },
+        { target: "node2", bwlimit: 150, online: 1, target_storage: "ceph-pool" },
         600000
       );
     });
