@@ -6,6 +6,20 @@ import { nodeParam, vmidParam, targetNodeParam } from "../schemas.js";
 const DONT_MOVE_TAG = "dont-move";
 
 /**
+ * Extract a human-readable error message from any thrown value.
+ */
+function errMsg(err: unknown): string {
+  if (err instanceof Error) return err.message;
+  if (typeof err === "string") return err;
+  if (typeof err === "object" && err !== null) {
+    const o = err as any;
+    if (typeof o.message === "string") return o.message;
+    if (typeof o.stderr === "string") return o.stderr;
+  }
+  return JSON.stringify(err);
+}
+
+/**
  * Read the tags field from a guest's config. Returns an array of tag strings.
  */
 async function getGuestTags(
@@ -50,7 +64,8 @@ async function performMigration(
   vmid: number,
   target: string,
   bandwidth: number | undefined,
-  targetStorage?: string
+  targetStorage?: string,
+  online?: boolean
 ): Promise<{ newVmid: number; method: "migrate" | "move" | "clone-fallback" }> {
   if (type === "qemu") {
     const params: Record<string, string | number | boolean> = {
@@ -73,9 +88,13 @@ async function performMigration(
   try {
     const params: Record<string, string | number | boolean> = {
       target,
-      online: 1,
       bwlimit: (bandwidth ?? 150) * 1024,
     };
+    if (online) {
+      params.online = 1;
+    } else {
+      params.restart = 1;
+    }
     if (targetStorage) params.target_storage = targetStorage;
     const result = await pvesh(
       "create",
@@ -167,9 +186,13 @@ export function registerMigrationTools(server: McpServer): void {
           .string()
           .optional()
           .describe("Target storage pool (if different from source)"),
+        online: z
+          .boolean()
+          .default(false)
+          .describe("Use live/online migration (QEMU: no downtime; LXC: experimental). LXC defaults to restart."),
       },
     },
-    async ({ node, vmid, target_node, bandwidth, target_storage }) => {
+    async ({ node, vmid, target_node, bandwidth, target_storage, online }) => {
       const { node: guestNode, type } = await resolveGuest(node, vmid);
 
       if (guestNode === target_node) {
@@ -186,7 +209,8 @@ export function registerMigrationTools(server: McpServer): void {
         vmid,
         target_node,
         bandwidth,
-        target_storage
+        target_storage,
+        online
       );
 
       return {
@@ -227,9 +251,13 @@ export function registerMigrationTools(server: McpServer): void {
           .boolean()
           .default(false)
           .describe("Preview only: show what would be migrated/skipped without performing migrations"),
+        online: z
+          .boolean()
+          .default(false)
+          .describe("Use live/online migration (QEMU: no downtime; LXC: experimental). LXC defaults to restart."),
       },
     },
-    async ({ source_node, target_node, bandwidth, target_storage, dry_run }) => {
+    async ({ source_node, target_node, bandwidth, target_storage, dry_run, online }) => {
       if (source_node === target_node) {
         throw new ProxmoxError(
           `Source and target are the same node ('${source_node}'). Nothing to drain.`
@@ -320,7 +348,8 @@ export function registerMigrationTools(server: McpServer): void {
             g.vmid,
             target_node,
             bandwidth,
-            target_storage
+            target_storage,
+            online
           );
           if (result.newVmid !== g.vmid) {
             migrated.push(`${g.vmid} → ${result.newVmid} (${g.type}) "${g.name}" [clone]`);
@@ -331,7 +360,7 @@ export function registerMigrationTools(server: McpServer): void {
           failed.push({
             vmid: g.vmid,
             name: g.name,
-            error: err.message || String(err),
+            error: errMsg(err),
           });
         }
       }
