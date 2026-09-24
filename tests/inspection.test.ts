@@ -292,6 +292,25 @@ describe("inspection tools", () => {
       mockPvesh.mockRejectedValueOnce(new Error("fail"));
       await expect(server.tools["list_isos"]({ node: "pve" })).rejects.toThrow("fail");
     });
+
+    it("should throw when storage listing returns non-array", async () => {
+      mockPvesh.mockResolvedValueOnce({ message: "unexpected" });
+      await expect(server.tools["list_isos"]({ node: "pve" })).rejects.toThrow(
+        "Unexpected (non-array) response"
+      );
+    });
+
+    it("should skip storages whose content listing returns non-array", async () => {
+      const storages = [{ storage: "local" }, { storage: "bad" }];
+      mockPvesh
+        .mockResolvedValueOnce(storages)
+        .mockResolvedValueOnce([{ volid: "local:iso/a.iso", content: "iso" }])
+        .mockResolvedValueOnce({ message: "unsupported" }); // non-array content
+
+      const result = await server.tools["list_isos"]({ node: "pve" });
+      expect(result.content[0].text).toContain("a.iso");
+      expect(result.content[0].text).not.toContain("unsupported");
+    });
   });
 
   describe("list_lxc_templates", () => {
@@ -323,6 +342,25 @@ describe("inspection tools", () => {
     it("should propagate errors from storage listing", async () => {
       mockPvesh.mockRejectedValueOnce(new Error("fail"));
       await expect(server.tools["list_lxc_templates"]({ node: "pve" })).rejects.toThrow("fail");
+    });
+
+    it("should throw when storage listing returns non-array", async () => {
+      mockPvesh.mockResolvedValueOnce({ message: "unexpected" });
+      await expect(server.tools["list_lxc_templates"]({ node: "pve" })).rejects.toThrow(
+        "Unexpected (non-array) response"
+      );
+    });
+
+    it("should skip storages whose content listing returns non-array", async () => {
+      const storages = [{ storage: "local" }, { storage: "bad" }];
+      mockPvesh
+        .mockResolvedValueOnce(storages)
+        .mockResolvedValueOnce([{ volid: "local:vztmpl/a.tar", content: "vztmpl" }])
+        .mockResolvedValueOnce({ message: "unsupported" }); // non-array content
+
+      const result = await server.tools["list_lxc_templates"]({ node: "pve" });
+      expect(result.content[0].text).toContain("a.tar");
+      expect(result.content[0].text).not.toContain("unsupported");
     });
   });
 

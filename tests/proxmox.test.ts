@@ -15,6 +15,10 @@ import {
   generateMac,
   waitForTask,
   expandHome,
+  resolveGuest,
+  asObject,
+  asString,
+  ProxmoxParseError,
 } from "../src/proxmox.js";
 
 // Helper to simulate execFile success
@@ -221,6 +225,13 @@ describe("getGuestInfo", () => {
     mockSshSuccess(JSON.stringify(resources));
     await expect(getGuestInfo(999)).rejects.toThrow("VMID 999 not found in cluster");
   });
+
+  it("should throw when cluster resources returns non-array", async () => {
+    mockSshSuccess(JSON.stringify({ error: "bad" }));
+    await expect(getGuestInfo(100)).rejects.toThrow(
+      "Unexpected (non-array) response from /cluster/resources"
+    );
+  });
 });
 
 // --- getNextVmid ---
@@ -244,6 +255,13 @@ describe("getNextVmid", () => {
     mockSshSuccess(JSON.stringify(resources));
     const result = await getNextVmid();
     expect(result).toBe(104);
+  });
+
+  it("should throw when cluster resources returns non-array", async () => {
+    mockSshSuccess(JSON.stringify({ error: "bad" }));
+    await expect(getNextVmid()).rejects.toThrow(
+      "Unexpected (non-array) response from /cluster/resources"
+    );
   });
 });
 
@@ -390,6 +408,24 @@ describe("waitForTask", () => {
     );
   });
 
+  it("should handle log returning null", async () => {
+    mockExecFile.mockImplementation(
+      (_cmd: string, args: string[], _opts: any, callback: Function) => {
+        const remoteCmd = args[args.length - 1];
+        if (remoteCmd.includes("/status")) {
+          callback(null, { stdout: JSON.stringify({ status: "stopped", exitstatus: "ERROR" }), stderr: "" });
+        } else if (remoteCmd.includes("/log")) {
+          callback(null, { stdout: "", stderr: "" });
+        } else {
+          callback(null, { stdout: "", stderr: "" });
+        }
+      }
+    );
+    await expect(waitForTask("pve", "UPID:pve:123:456:789:task:root@pam:")).rejects.toThrow(
+      "failed: exitstatus=ERROR"
+    );
+  });
+
   it("should throw on timeout", async () => {
     mockSshSuccess(JSON.stringify({ status: "running", exitstatus: "OK" }));
     // Use a very short timeout to trigger timeout path
@@ -413,5 +449,108 @@ describe("waitForTask", () => {
     );
     await expect(waitForTask("pve", "UPID:pve:123:456:789:task:root@pam:")).resolves.toBeUndefined();
     expect(callCount).toBeGreaterThanOrEqual(2);
+  });
+});
+
+// --- resolveGuest ---
+
+describe("resolveGuest", () => {
+  it("should find QEMU VM on the specified node", async () => {
+    mockSshSuccess(JSON.stringify({ status: "running" }));
+    const result = await resolveGuest("pve", 100);
+    expect(result).toEqual({ node: "pve", type: "qemu" });
+    expect(mockExecFile).toHaveBeenCalledTimes(1);
+  });
+
+  it("should fall back to LXC when QEMU is not found", async () => {
+    mockExecFile.mockImplementation(
+      (_cmd: string, _args: string[], _opts: any, callback: Function) => {
+        callback(new Error("not found"), { stdout: "", stderr: "not found" });
+      }
+    );
+    // Override: first call (qemu) fails, second call (lxc) succeeds
+    let callCount = 0;
+    mockExecFile.mockImplementation(
+      (_cmd: string, _args: string[], _opts: any, callback: Function) => {
+        callCount++;
+        if (callCount === 1) {
+          const err: any = new Error("not found");
+          err.code = 1;
+          err.stderr = "not found";
+          callback(err, { stdout: "", stderr: "not found" });
+        } else {
+          callback(null, { stdout: JSON.stringify({ status: "running" }), stderr: "" });
+        }
+      }
+    );
+    const result = await resolveGuest("pve", 101);
+    expect(result).toEqual({ node: "pve", type: "lxc" });
+    expect(callCount).toBe(2);
+  });
+
+  it("should fall back to cluster search when not on specified node", async () => {
+    let callCount = 0;
+    mockExecFile.mockImplementation(
+      (_cmd: string, _args: string[], _opts: any, callback: Function) => {
+        callCount++;
+        if (callCount <= 2) {
+          const err: any = new Error("not found");
+          err.code = 1;
+          err.stderr = "not found";
+          callback(err, { stdout: "", stderr: "not found" });
+        } else {
+          // cluster/resources response
+          callback(null, {
+            stdout: JSON.stringify([
+              { vmid: 200, type: "qemu", name: "RemoteVM", node: "node2" },
+            ]),
+            stderr: "",
+          });
+        }
+      }
+    );
+    const result = await resolveGuest("pve", 200);
+    expect(result).toEqual({ node: "node2", type: "qemu" });
+  });
+});
+
+// --- asObject ---
+
+describe("asObject", () => {
+  it("should return a plain object", () => {
+    const obj = { status: "running" };
+    expect(asObject(obj)).toBe(obj);
+  });
+
+  it("should return null for an array", () => {
+    expect(asObject([1, 2, 3])).toBeNull();
+  });
+
+  it("should return null for a string", () => {
+    expect(asObject("hello")).toBeNull();
+  });
+
+  it("should return null for null", () => {
+    expect(asObject(null)).toBeNull();
+  });
+});
+
+// --- asString ---
+
+describe("asString", () => {
+  it("should return a string", () => {
+    expect(asString("UPID:pve:1:2:3:")).toBe("UPID:pve:1:2:3:");
+  });
+
+  it("should return null for an object", () => {
+    expect(asString({ key: "value" })).toBeNull();
+  });
+
+  it("should return null for an array", () => {
+    expect(asString([1, 2])).toBeNull();
+  });
+
+  it("should return null for null", () => {
+    expect(asString(null)).toBeNull();
   });
 });
