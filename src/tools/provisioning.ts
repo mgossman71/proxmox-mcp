@@ -1,6 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { pvesh, getNextVmid, generateMac, getGuestInfo, ProxmoxError, waitForTask, asString } from "../proxmox.js";
+import { assertMovable } from "./migration.js";
 import { nodeParam, storageParam } from "../schemas.js";
 
 export function registerProvisioningTools(server: McpServer): void {
@@ -159,6 +160,11 @@ export function registerProvisioningTools(server: McpServer): void {
       const newId = new_vmid ?? await getNextVmid();
       const info = await getGuestInfo(vmid);
       const target = target_node ?? node;
+
+      // Block cross-node clones of dont-move tagged guests
+      if (target !== info.node) {
+        await assertMovable(info.node, info.type, vmid, info.name);
+      }
 
       const params: Record<string, string | number | boolean> = {
         target,

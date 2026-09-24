@@ -43,7 +43,7 @@ async function getGuestTags(
 /**
  * Check if a guest has the "dont-move" tag. Throws if it does.
  */
-async function assertMovable(
+export async function assertMovable(
   node: string,
   type: "qemu" | "lxc",
   vmid: number,
@@ -53,7 +53,7 @@ async function assertMovable(
   if (tags.includes(DONT_MOVE_TAG)) {
     const label = name ? `'${name}'` : "";
     throw new ProxmoxError(
-      `Refusing to migrate VMID ${vmid} ${label}: tagged "${DONT_MOVE_TAG}". ` +
+      `Refusing to move VMID ${vmid} ${label}: tagged "${DONT_MOVE_TAG}". ` +
         `This guest uses fixed resources on its current chassis and must not be moved.`
     );
   }

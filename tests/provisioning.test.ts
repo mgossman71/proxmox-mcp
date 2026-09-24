@@ -413,14 +413,14 @@ describe("provisioning tools", () => {
     it("should use target_node if specified", async () => {
       mockGetNextVmid.mockResolvedValue(118);
       mockGetGuestInfo.mockResolvedValue({ node: "pve", type: "qemu", name: "OrigVM" });
-      mockPvesh.mockResolvedValue(null);
+      mockPvesh.mockResolvedValueOnce({ tags: "" }).mockResolvedValue(null);
       mockWaitForTask.mockResolvedValue(undefined);
 
       await server.tools["clone_guest"]({
         node: "pve", vmid: 100, new_name: "Migrated", target_node: "node2",
       });
 
-      expect(mockPvesh.mock.calls[0][2].target).toBe("node2");
+      expect(mockPvesh.mock.calls[1][2].target).toBe("node2");
       expect(mockWaitForTask).toHaveBeenCalledWith("node2", null);
     });
 
