@@ -19,7 +19,7 @@ const SEGMENT_MESSAGE =
 export const nodeParam = z
   .string()
   .regex(SAFE_PATH_SEGMENT, `Node name ${SEGMENT_MESSAGE}`)
-  .default("pve")
+  .default(process.env.PROXMOX_NODE || "pve")
   .describe("Proxmox node name");
 
 /** Storage pool name (no default — required where used). */
