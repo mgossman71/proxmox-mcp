@@ -43,11 +43,12 @@ vi.mock("../src/proxmox.js", () => {
   };
 });
 
-import { pvesh, waitForTask } from "../src/proxmox.js";
+import { pvesh, waitForTask, getNextVmid } from "../src/proxmox.js";
 import { registerMigrationTools } from "../src/tools/migration.js";
 
 const mockPvesh = vi.mocked(pvesh);
 const mockWaitForTask = vi.mocked(waitForTask);
+const mockGetNextVmid = vi.mocked(getNextVmid);
 
 function createMockServer() {
   const tools: Record<string, any> = {};
@@ -123,6 +124,48 @@ describe("migration tools", () => {
         600000
       );
       expect(result.content[0].text).toContain("Migrated lxc VMID 200");
+    });
+
+    it("should fall back to clone when LXC move endpoint is unavailable", async () => {
+      mockPvesh
+        .mockRejectedValueOnce(new Error("nf"))                // resolveGuest: qemu fails
+        .mockResolvedValueOnce({ status: "running" })          // resolveGuest: lxc check
+        .mockResolvedValueOnce({ tags: "" })                   // getGuestTags: config (no tags)
+        .mockRejectedValueOnce(new Error(                     // move endpoint: not available
+          "No 'create' handler defined for '/nodes/pve/lxc/200/move'"
+        ))
+        .mockResolvedValueOnce({ hostname: "myct", tags: "" }) // config read for clone fallback
+        .mockResolvedValueOnce("UPID:pve:1:clone")            // clone task
+        .mockResolvedValueOnce("UPID:node2:2:start")          // start clone
+        .mockResolvedValueOnce("UPID:pve:3:stop")             // stop original
+        .mockResolvedValueOnce("UPID:pve:4:delete");          // delete original
+      mockGetNextVmid.mockResolvedValue(300);
+      mockWaitForTask.mockResolvedValue(undefined);
+
+      const result = await server.tools["migrate_guest"]({
+        node: "pve",
+        vmid: 200,
+        target_node: "node2",
+      });
+
+      // Verify clone was called
+      expect(mockPvesh).toHaveBeenCalledWith(
+        "create",
+        "/nodes/pve/lxc/200/clone",
+        { target: "node2", vmid: 300, name: "myct" },
+        600000
+      );
+      // Verify original was stopped and deleted
+      expect(mockPvesh).toHaveBeenCalledWith(
+        "create", "/nodes/pve/lxc/200/status/stop", {}, 120000
+      );
+      expect(mockPvesh).toHaveBeenCalledWith(
+        "delete", "/nodes/pve/lxc/200", {}, 120000
+      );
+      // Result should report the new VMID
+      expect(result.content[0].text).toContain("200");
+      expect(result.content[0].text).toContain("300");
+      expect(result.content[0].text).toContain("clone");
     });
 
     it("should refuse if guest is already on target node", async () => {

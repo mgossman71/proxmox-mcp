@@ -1,6 +1,6 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { pvesh, resolveGuest, waitForTask, asString, asObject, ProxmoxError } from "../proxmox.js";
+import { pvesh, resolveGuest, waitForTask, asString, asObject, getNextVmid, ProxmoxError } from "../proxmox.js";
 import { nodeParam, vmidParam, targetNodeParam } from "../schemas.js";
 
 const DONT_MOVE_TAG = "dont-move";
@@ -42,6 +42,7 @@ async function assertMovable(
 
 /**
  * Perform a single guest migration to the target node.
+ * Returns the final VMID (may differ from input for LXC clone fallback).
  */
 async function performMigration(
   node: string,
@@ -50,7 +51,7 @@ async function performMigration(
   target: string,
   bandwidth: number | undefined,
   targetStorage?: string
-): Promise<void> {
+): Promise<{ newVmid: number; method: "migrate" | "move" | "clone-fallback" }> {
   if (type === "qemu") {
     const params: Record<string, string | number | boolean> = {
       target,
@@ -65,7 +66,11 @@ async function performMigration(
       600000
     );
     await waitForTask(node, asString(result), 600000);
-  } else {
+    return { newVmid: vmid, method: "migrate" };
+  }
+
+  // LXC: try native move endpoint first (PVE 7.3+)
+  try {
     const params: Record<string, string | number | boolean> = {
       target,
       replicate: 1,
@@ -78,6 +83,64 @@ async function performMigration(
       600000
     );
     await waitForTask(node, asString(result), 600000);
+    return { newVmid: vmid, method: "move" };
+  } catch (err: any) {
+    // If the endpoint doesn't exist at all, fall back to clone-based approach
+    const msg = err.message || String(err);
+    if (!msg.includes("No 'create' handler") && !msg.includes("handler defined")) {
+      throw err;
+    }
+
+    // Clone-based fallback: clone → start clone → stop original → delete original
+    const config = asObject(
+      await pvesh("get", `/nodes/${node}/lxc/${vmid}/config`)
+    );
+    const name = config?.hostname || `ct-${vmid}`;
+    const newVmid = await getNextVmid();
+
+    // Clone to target
+    const cloneParams: Record<string, string | number | boolean> = {
+      target,
+      vmid: newVmid,
+      name,
+    };
+    if (targetStorage) cloneParams.target_storage = targetStorage;
+    const cloneResult = await pvesh(
+      "create",
+      `/nodes/${node}/lxc/${vmid}/clone`,
+      cloneParams,
+      600000
+    );
+    await waitForTask(target, asString(cloneResult), 600000);
+
+    // Start the clone on target
+    const startResult = await pvesh(
+      "create",
+      `/nodes/${target}/lxc/${newVmid}/status/start`,
+      {},
+      120000
+    );
+    await waitForTask(target, asString(startResult), 120000);
+
+    // Stop the original
+    const stopResult = await pvesh(
+      "create",
+      `/nodes/${node}/lxc/${vmid}/status/stop`,
+      {},
+      120000
+    );
+    await waitForTask(node, asString(stopResult), 120000);
+
+    // Delete the original
+    const delResult = await pvesh(
+      "delete",
+      `/nodes/${node}/lxc/${vmid}`,
+      {},
+      120000
+    );
+    await waitForTask(node, asString(delResult), 120000);
+
+    return { newVmid, method: "clone-fallback" };
   }
 }
 
@@ -116,7 +179,7 @@ export function registerMigrationTools(server: McpServer): void {
 
       await assertMovable(guestNode, type, vmid);
 
-      await performMigration(
+      const result = await performMigration(
         guestNode,
         type,
         vmid,
@@ -129,7 +192,9 @@ export function registerMigrationTools(server: McpServer): void {
         content: [
           {
             type: "text" as const,
-            text: `OK: Migrated ${type} VMID ${vmid} from '${guestNode}' to '${target_node}'.`,
+            text: result.newVmid !== vmid
+              ? `OK: Migrated ${type} VMID ${vmid} → ${result.newVmid} (clone) from '${guestNode}' to '${target_node}'.`
+              : `OK: Migrated ${type} VMID ${vmid} from '${guestNode}' to '${target_node}'.`,
           },
         ],
       };
@@ -248,7 +313,7 @@ export function registerMigrationTools(server: McpServer): void {
 
       for (const g of toMigrate) {
         try {
-          await performMigration(
+          const result = await performMigration(
             source_node,
             g.type,
             g.vmid,
@@ -256,7 +321,11 @@ export function registerMigrationTools(server: McpServer): void {
             bandwidth,
             target_storage
           );
-          migrated.push(`${g.vmid} (${g.type}) "${g.name}"`);
+          if (result.newVmid !== g.vmid) {
+            migrated.push(`${g.vmid} → ${result.newVmid} (${g.type}) "${g.name}" [clone]`);
+          } else {
+            migrated.push(`${g.vmid} (${g.type}) "${g.name}"`);
+          }
         } catch (err: any) {
           failed.push({
             vmid: g.vmid,
