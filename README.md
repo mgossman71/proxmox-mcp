@@ -14,7 +14,7 @@ Proxmox VE (pvesh)
 
 ## Prerequisites
 
-- Proxmox VE 8.x with SSH access
+- Proxmox VE 8.x or later (tested on 9.2)
 - Your SSH public key added to the Proxmox host (`~/.ssh/authorized_keys`)
 - Docker + Docker Compose
 
@@ -79,7 +79,7 @@ curl http://localhost:3000/health
 
 ## Tools
 
-> **Scope note:** All lifecycle and power operations target **guests** (QEMU VMs or LXC containers) only. This server does **not** expose physical host power management (node shutdown/reboot) or destructive guest deletion operations.
+> **Scope note:** All lifecycle and power operations target **guests** (QEMU VMs or LXC containers) only. This server does **not** expose physical host power management (node shutdown/reboot) or destructive guest deletion operations. Guests tagged `dont-move` are protected from migration and cross-node cloning.
 
 ### Inspection
 | Tool | Description |
@@ -117,8 +117,14 @@ curl http://localhost:3000/health
 |------|-------------|
 | `create_vm` | Create a QEMU VM from an ISO |
 | `create_container` | Create an LXC container from a template |
-| `clone_guest` | Clone a VM or container |
+| `clone_guest` | Clone a VM or container (cross-node clones refused for `dont-move` tagged guests) |
 | `set_guest_config` | Modify VM/container settings (CPU, memory, swap (LXC), name, onboot) |
+
+### Migration
+| Tool | Description |
+|------|-------------|
+| `migrate_guest` | Live-migrate a QEMU VM or move an LXC container to another node |
+| `drain_node` | Migrate all guests off a node (for maintenance/decommission) |
 
 ## Development
 
