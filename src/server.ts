@@ -3,6 +3,7 @@ import { registerInspectionTools } from "./tools/inspection.js";
 import { registerLifecycleTools } from "./tools/lifecycle.js";
 import { registerSnapshotTools } from "./tools/snapshots.js";
 import { registerProvisioningTools } from "./tools/provisioning.js";
+import { registerMigrationTools } from "./tools/migration.js";
 
 export function createServer(): McpServer {
   const server = new McpServer({
@@ -14,6 +15,7 @@ export function createServer(): McpServer {
   registerLifecycleTools(server);
   registerSnapshotTools(server);
   registerProvisioningTools(server);
+  registerMigrationTools(server);
 
   return server;
 }

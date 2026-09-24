@@ -30,3 +30,9 @@ export const storageParam = z
 
 /** VM or container ID. */
 export const vmidParam = z.number().describe("VM or container ID");
+
+/** Target node for migration (no default — must be explicitly specified). */
+export const targetNodeParam = z
+  .string()
+  .regex(SAFE_PATH_SEGMENT, `Target node name ${SEGMENT_MESSAGE}`)
+  .describe("Target Proxmox node name to migrate to");
