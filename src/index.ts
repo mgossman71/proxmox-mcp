@@ -84,12 +84,13 @@ app.listen(PORT, () => {
   console.log(`Proxmox MCP server listening on http://0.0.0.0:${PORT}`);
   console.log(`  MCP endpoint:   http://0.0.0.0:${PORT}/mcp`);
   console.log(`  Health check:   http://0.0.0.0:${PORT}/health`);
-  console.log(`  SSH target:     ${process.env.PROXMOX_SSH_USER || "root"}@${process.env.PROXMOX_SSH_HOST || "10.0.0.19"}`);
-  // Fail-loud about missing configuration instead of silently guessing.
+  console.log(`  SSH target:     ${process.env.PROXMOX_SSH_USER || "root"}@${process.env.PROXMOX_SSH_HOST}`);
+  // Fail-loud about missing configuration.
   if (!process.env.PROXMOX_SSH_HOST) {
-    console.warn(
-      "  ⚠ PROXMOX_SSH_HOST is not set; defaulting to 10.0.0.19"
+    console.error(
+      "  ✗ PROXMOX_SSH_HOST is not set. Set it in your .env file."
     );
+    process.exit(1);
   }
   if (!MCP_AUTH_TOKEN) {
     console.warn(
