@@ -53,6 +53,33 @@ PROXMOX_NO_MIGRATE_TAG=dont-move
 
 `MCP_PORT` is the **host** port; the container always listens on 3000 internally.
 
+#### Updating a host with local .env changes
+
+`.env` is **tracked in git**, so each host that customises it (a different
+`PROXMOX_SSH_HOST`, say) carries a permanent local modification. When a commit
+changes `.env`, `git pull` on that host refuses rather than clobber it:
+
+```
+error: Your local changes to the following files would be overwritten by merge: .env
+Please commit your changes or stash them before you merge. Aborting
+```
+
+Stash the host's own values, pull, then put them back:
+
+```bash
+git stash push -m "host env" .env
+git pull
+git stash pop
+```
+
+Git merges the two sets of changes, so the host keeps its own values and gains
+whatever the commit added. Confirm with `grep PROXMOX_ .env`. If a future change
+edits a line a host has customised, `git stash pop` reports a conflict in
+`.env` — resolve it keeping the host's values, then `git stash drop`.
+
+`git status` will keep showing `.env` as modified on that host. That is the
+steady state, and the trade-off of keeping `.env` in version control.
+
 ### 3. Authentication
 
 `/mcp` is protected by a shared-secret Bearer token. Set `MCP_AUTH_TOKEN` and
