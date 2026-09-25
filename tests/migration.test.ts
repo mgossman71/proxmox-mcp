@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { z } from "zod";
 vi.mock("../src/proxmox.js", () => {
   const pvesh = vi.fn();
@@ -48,7 +48,7 @@ vi.mock("../src/proxmox.js", () => {
 });
 
 import { pvesh, waitForTask, getNextVmid } from "../src/proxmox.js";
-import { registerMigrationTools } from "../src/tools/migration.js";
+import { registerMigrationTools, noMigrateTag } from "../src/tools/migration.js";
 
 const mockPvesh = vi.mocked(pvesh);
 const mockWaitForTask = vi.mocked(waitForTask);
@@ -56,12 +56,17 @@ const mockGetNextVmid = vi.mocked(getNextVmid);
 
 function createMockServer() {
   const tools: Record<string, any> = {};
+  // Registration metadata, kept so tests can assert on what the client is told
+  // (descriptions are built at registration time and can embed config).
+  const meta: Record<string, any> = {};
   return {
     tools,
-    registerTool(name: string, meta: any, handler: any) {
+    meta,
+    registerTool(name: string, toolMeta: any, handler: any) {
       // Apply the tool's own inputSchema the way the MCP SDK does, so every
       // `.default()` is exercised and tests see the values production sees.
-      const schema = meta?.inputSchema ? z.object(meta.inputSchema) : null;
+      const schema = toolMeta?.inputSchema ? z.object(toolMeta.inputSchema) : null;
+      meta[name] = toolMeta;
       tools[name] = async (args: any = {}) =>
         handler(schema ? schema.parse(args) : args);
     },
@@ -696,6 +701,36 @@ describe("migration tools", () => {
       ).rejects.toThrow('tagged "dont-move"');
     });
 
+    // PVE permits uppercase in tags, so an exact comparison would let these
+    // through -- failing OPEN on the one guard whose job is to stop a move.
+    it("should refuse a guest tagged DONT-MOVE (uppercase)", async () => {
+      mockPvesh
+        .mockResolvedValueOnce({ status: "running" })
+        .mockResolvedValueOnce({ tags: "web;DONT-MOVE" });
+
+      await expect(
+        server.tools["migrate_guest"]({
+          node: "pve",
+          vmid: 105,
+          target_node: "node2",
+        })
+      ).rejects.toThrow('tagged "dont-move"');
+    });
+
+    it("should refuse a guest tagged Dont-Move (mixed case)", async () => {
+      mockPvesh
+        .mockResolvedValueOnce({ status: "running" })
+        .mockResolvedValueOnce({ tags: "Dont-Move" });
+
+      await expect(
+        server.tools["migrate_guest"]({
+          node: "pve",
+          vmid: 105,
+          target_node: "node2",
+        })
+      ).rejects.toThrow(/Refusing to move VMID 105/);
+    });
+
     it("should refuse migration if config read returns null (fail-closed)", async () => {
       mockPvesh
         .mockResolvedValueOnce({ status: "running" })  // resolveGuest: qemu
@@ -1164,5 +1199,144 @@ describe("migration tools", () => {
 
       expect(result.content[0].text).toContain("has no guests to drain");
     });
+  });
+});
+
+// ─── configurable no-migrate tag ──────────────────────────────────────────────
+
+describe("noMigrateTag", () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  it("defaults to dont-move when PROXMOX_NO_MIGRATE_TAG is unset", () => {
+    vi.stubEnv("PROXMOX_NO_MIGRATE_TAG", undefined as any);
+    expect(noMigrateTag()).toBe("dont-move");
+  });
+
+  it("uses the configured tag, trimmed", () => {
+    vi.stubEnv("PROXMOX_NO_MIGRATE_TAG", "  pinned  ");
+    expect(noMigrateTag()).toBe("pinned");
+  });
+
+  // A blank variable must never silently disable the protection.
+  it("falls back to the default when set to whitespace only", () => {
+    vi.stubEnv("PROXMOX_NO_MIGRATE_TAG", "   ");
+    expect(noMigrateTag()).toBe("dont-move");
+  });
+
+  it("falls back to the default when set to an empty string", () => {
+    vi.stubEnv("PROXMOX_NO_MIGRATE_TAG", "");
+    expect(noMigrateTag()).toBe("dont-move");
+  });
+});
+
+describe("migration tools with a custom no-migrate tag", () => {
+  let server: any;
+
+  beforeEach(() => {
+    vi.resetAllMocks();
+    // Stubbed BEFORE registration: tool descriptions embed the tag and are
+    // built when registerTool runs.
+    vi.stubEnv("PROXMOX_NO_MIGRATE_TAG", "pinned");
+    server = createMockServer();
+    registerMigrationTools(server);
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  it("refuses a guest carrying the configured tag", async () => {
+    mockPvesh
+      .mockResolvedValueOnce({ status: "running" })
+      .mockResolvedValueOnce({ tags: "infra;pinned" });
+
+    await expect(
+      server.tools["migrate_guest"]({
+        node: "pve",
+        vmid: 105,
+        target_node: "node2",
+      })
+    ).rejects.toThrow('tagged "pinned"');
+  });
+
+  it("matches the configured tag case-insensitively too", async () => {
+    mockPvesh
+      .mockResolvedValueOnce({ status: "running" })
+      .mockResolvedValueOnce({ tags: "PINNED" });
+
+    await expect(
+      server.tools["migrate_guest"]({
+        node: "pve",
+        vmid: 105,
+        target_node: "node2",
+      })
+    ).rejects.toThrow('tagged "pinned"');
+  });
+
+  // Overriding the tag replaces the default -- it does not add to it.
+  it("migrates a guest tagged dont-move once the tag is overridden", async () => {
+    mockPvesh
+      .mockResolvedValueOnce({ status: "running" })
+      .mockResolvedValueOnce({ tags: "dont-move" })
+      .mockResolvedValueOnce("UPID:pve:1:migrate");
+    mockWaitForTask.mockResolvedValue(undefined);
+
+    const result = await server.tools["migrate_guest"]({
+      node: "pve",
+      vmid: 105,
+      target_node: "node2",
+    });
+
+    expect(result.content[0].text).toContain("Migrated qemu VMID 105");
+  });
+
+  it("names the configured tag in both tool descriptions", () => {
+    expect(server.meta["migrate_guest"].description).toContain("'pinned'");
+    expect(server.meta["drain_node"].description).toContain("'pinned'");
+    expect(server.meta["migrate_guest"].description).not.toContain("dont-move");
+  });
+
+  it("reports the configured tag in drain_node output", async () => {
+    mockPvesh
+      .mockResolvedValueOnce([
+        { vmid: 100, name: "web", status: "running" },
+        { vmid: 105, name: "gpu-box", status: "running" },
+      ])
+      .mockResolvedValueOnce([])              // no lxc
+      .mockResolvedValueOnce({ tags: "" })    // 100
+      .mockResolvedValueOnce({ tags: "pinned" }) // 105
+      .mockResolvedValueOnce("UPID:pve:1:migrate");
+    mockWaitForTask.mockResolvedValue(undefined);
+
+    const text = (
+      await server.tools["drain_node"]({
+        source_node: "pve",
+        target_node: "node2",
+      })
+    ).content[0].text;
+
+    expect(text).toContain("Skipped (pinned): 1");
+    expect(text).toContain("Skipped (tagged 'pinned'):");
+    expect(text).toContain("gpu-box");
+    expect(text).not.toContain("dont-move");
+  });
+
+  it("reports the configured tag in a dry run", async () => {
+    mockPvesh
+      .mockResolvedValueOnce([{ vmid: 105, name: "gpu-box", status: "running" }])
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce({ tags: "pinned" });
+
+    const text = (
+      await server.tools["drain_node"]({
+        source_node: "pve",
+        target_node: "node2",
+        dry_run: true,
+      })
+    ).content[0].text;
+
+    expect(text).toContain('Skipped — tagged "pinned"');
   });
 });

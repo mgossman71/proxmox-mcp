@@ -11,4 +11,6 @@ services:
       PROXMOX_SSH_USER: ${PROXMOX_SSH_USER:-root}
       PROXMOX_SSH_KEY: /secrets/id_rsa
       MCP_AUTH_TOKEN: ${MCP_AUTH_TOKEN:-}
+      PROXMOX_NODE: ${PROXMOX_NODE:-pve}
+      PROXMOX_NO_MIGRATE_TAG: ${PROXMOX_NO_MIGRATE_TAG:-}
     restart: unless-stopped

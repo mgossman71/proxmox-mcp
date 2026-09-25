@@ -5,6 +5,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { createServer } from "./server.js";
 import { bearerAuth } from "./auth.js";
+import { noMigrateTag } from "./tools/migration.js";
 
 const PORT = parseInt(process.env.MCP_PORT || "3000", 10);
 // Shared-secret auth for /mcp. When unset, requests are allowed (a warning is
@@ -86,6 +87,8 @@ app.listen(PORT, () => {
   console.log(`  MCP endpoint:   http://0.0.0.0:${PORT}/mcp`);
   console.log(`  Health check:   http://0.0.0.0:${PORT}/health`);
   console.log(`  SSH target:     ${process.env.PROXMOX_SSH_USER || "root"}@${process.env.PROXMOX_SSH_HOST}`);
+  console.log(`  Default node:   ${process.env.PROXMOX_NODE || "pve"}`);
+  console.log(`  No-migrate tag: ${noMigrateTag()} (case-insensitive)`);
   // Fail-loud about missing configuration.
   if (!process.env.PROXMOX_SSH_HOST) {
     console.error(

@@ -3,7 +3,29 @@ import { z } from "zod";
 import { pvesh, resolveGuest, waitForTask, asString, asObject, getNextVmid, ProxmoxError } from "../proxmox.js";
 import { nodeParam, vmidParam, targetNodeParam } from "../schemas.js";
 
-const DONT_MOVE_TAG = "dont-move";
+const DEFAULT_NO_MIGRATE_TAG = "dont-move";
+
+/**
+ * The tag that marks a guest as un-migratable, from PROXMOX_NO_MIGRATE_TAG.
+ *
+ * Read per call rather than at module load so it is testable, and so the value
+ * is picked up wherever it is needed rather than frozen at import. Unset, empty
+ * and whitespace-only all collapse to the default: a blank variable must never
+ * silently disable the protection.
+ */
+export function noMigrateTag(): string {
+  return process.env.PROXMOX_NO_MIGRATE_TAG?.trim() || DEFAULT_NO_MIGRATE_TAG;
+}
+
+/**
+ * Case-insensitive tag match. PVE permits uppercase in tags, so an exact
+ * comparison would let `Dont-Move` through -- failing open, which is the wrong
+ * direction for a guard whose job is to stop a guest being moved.
+ */
+function hasTag(tags: string[], tag: string): boolean {
+  const wanted = tag.toLowerCase();
+  return tags.some((t) => t.toLowerCase() === wanted);
+}
 
 /**
  * PVE's `bwlimit` is expressed in KiB/s on every migrate/clone endpoint, while
@@ -79,7 +101,7 @@ async function getGuestTags(
 }
 
 /**
- * Check if a guest has the "dont-move" tag. Throws if it does.
+ * Check if a guest carries the configured no-migrate tag. Throws if it does.
  */
 export async function assertMovable(
   node: string,
@@ -88,10 +110,11 @@ export async function assertMovable(
   name?: string
 ): Promise<void> {
   const tags = await getGuestTags(node, type, vmid);
-  if (tags.includes(DONT_MOVE_TAG)) {
+  const tag = noMigrateTag();
+  if (hasTag(tags, tag)) {
     const label = name ? `'${name}'` : "";
     throw new ProxmoxError(
-      `Refusing to move VMID ${vmid} ${label}: tagged "${DONT_MOVE_TAG}". ` +
+      `Refusing to move VMID ${vmid} ${label}: tagged "${tag}". ` +
         `This guest uses fixed resources on its current chassis and must not be moved.`
     );
   }
@@ -350,7 +373,8 @@ export function registerMigrationTools(server: McpServer): void {
       title: "Migrate Guest",
       description:
         "Migrate a QEMU VM or LXC container to another cluster node. " +
-        "Refuses to migrate guests tagged with 'dont-move'. " +
+        `Refuses to migrate guests tagged with '${noMigrateTag()}' ` +
+        "(matched case-insensitively). " +
         "The guest's run state is preserved: a stopped guest is moved offline " +
         "and left stopped, and a running guest ends up running on the target — " +
         "live-migrated if possible, otherwise shut down, moved and started " +
@@ -442,7 +466,8 @@ export function registerMigrationTools(server: McpServer): void {
       description:
         "Migrate all guests from one cluster node to another (for maintenance or decommissioning). " +
         "Each guest's run state is preserved: stopped guests stay stopped, running guests end up running. " +
-        "Automatically skips guests tagged 'dont-move'. " +
+        `Automatically skips guests tagged '${noMigrateTag()}' ` +
+        "(matched case-insensitively). " +
         "Migrations are performed sequentially to avoid saturating the network. " +
         "Use dry_run=true to preview what would be migrated without performing any migrations.",
       inputSchema: {
@@ -520,11 +545,13 @@ export function registerMigrationTools(server: McpServer): void {
       const skipped: { vmid: number; type: string; name: string; reason: string }[] = [];
       const failed: { vmid: number; name: string; error: string }[] = [];
 
+      const noMoveTag = noMigrateTag();
+
       for (const g of guests) {
         try {
           const tags = await getGuestTags(source_node, g.type, g.vmid);
-          if (tags.includes(DONT_MOVE_TAG)) {
-            skipped.push({ ...g, reason: "tagged 'dont-move'" });
+          if (hasTag(tags, noMoveTag)) {
+            skipped.push({ ...g, reason: `tagged '${noMoveTag}'` });
           } else {
             toMigrate.push(g);
           }
@@ -544,7 +571,7 @@ export function registerMigrationTools(server: McpServer): void {
         }
         if (skipped.length > 0) {
           lines.push("");
-          lines.push(`Skipped — tagged "dont-move" (${skipped.length}):`);
+          lines.push(`Skipped — tagged "${noMoveTag}" (${skipped.length}):`);
           for (const s of skipped) {
             lines.push(`  ${s.vmid} (${s.type}) "${s.name}"`);
           }
@@ -611,7 +638,7 @@ export function registerMigrationTools(server: McpServer): void {
       summary.push(`Drain of node '${source_node}' → '${target_node}' complete.`);
       summary.push("");
       summary.push(`  Migrated: ${migrated.length}`);
-      summary.push(`  Skipped (dont-move): ${skipped.length}`);
+      summary.push(`  Skipped (${noMoveTag}): ${skipped.length}`);
       summary.push(`  Failed: ${failed.length}`);
 
       if (migrated.length > 0) {
@@ -626,7 +653,7 @@ export function registerMigrationTools(server: McpServer): void {
 
       if (skipped.length > 0) {
         summary.push("");
-        summary.push("  Skipped (tagged 'dont-move'):");
+        summary.push(`  Skipped (tagged '${noMoveTag}'):`);
         for (const s of skipped) {
           summary.push(`    ⊘ ${s.vmid} (${s.type}) "${s.name}"`);
         }

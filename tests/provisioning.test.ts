@@ -430,6 +430,23 @@ describe("provisioning tools", () => {
       expect(creates).toHaveLength(0);
     });
 
+    // assertMovable is shared with the migration tools, so the clone guard gets
+    // case-insensitive matching too.
+    it("should refuse a cross-node clone when the tag is uppercase", async () => {
+      mockGetNextVmid.mockResolvedValue(120);
+      mockGetGuestInfo.mockResolvedValue({ node: "pve", type: "qemu", name: "Anchored" });
+      mockPvesh.mockResolvedValueOnce({ tags: "infra;DONT-MOVE" });
+
+      await expect(
+        server.tools["clone_guest"]({
+          node: "pve", vmid: 100, new_name: "Copy", target_node: "node2",
+        })
+      ).rejects.toThrow('tagged "dont-move"');
+
+      const creates = mockPvesh.mock.calls.filter((c) => c[0] === "create");
+      expect(creates).toHaveLength(0);
+    });
+
     it("should use target_node if specified", async () => {
       mockGetNextVmid.mockResolvedValue(118);
       mockGetGuestInfo.mockResolvedValue({ node: "pve", type: "qemu", name: "OrigVM" });

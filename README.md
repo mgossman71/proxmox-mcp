@@ -41,6 +41,14 @@ MCP_PORT=3000
 
 # Optional but strongly recommended — see Authentication below.
 MCP_AUTH_TOKEN=some-long-random-string
+
+# Default node for tools called without an explicit `node` (default: pve).
+PROXMOX_NODE=pve
+
+# Tag that marks a guest as un-migratable (default: dont-move).
+# Matched case-insensitively. A blank value falls back to the default rather
+# than disabling the protection.
+PROXMOX_NO_MIGRATE_TAG=dont-move
 ```
 
 `MCP_PORT` is the **host** port; the container always listens on 3000 internally.
@@ -104,7 +112,7 @@ Two things that make a client look broken when the server is fine:
 
 ## Tools
 
-> **Scope note:** All lifecycle and power operations target **guests** (QEMU VMs or LXC containers) only. This server does **not** expose physical host power management (node shutdown/reboot) or destructive guest deletion operations. Guests tagged `dont-move` are protected from migration and cross-node cloning.
+> **Scope note:** All lifecycle and power operations target **guests** (QEMU VMs or LXC containers) only. This server does **not** expose physical host power management (node shutdown/reboot) or destructive guest deletion operations. Guests tagged `dont-move` are protected from migration and cross-node cloning. That tag is configurable via `PROXMOX_NO_MIGRATE_TAG` and is matched **case-insensitively**, so `DONT-MOVE` and `Dont-Move` protect a guest just as well.
 
 ### Inspection
 | Tool | Description |
@@ -142,7 +150,7 @@ Two things that make a client look broken when the server is fine:
 |------|-------------|
 | `create_vm` | Create a QEMU VM from an ISO |
 | `create_container` | Create an LXC container from a template |
-| `clone_guest` | Clone a VM or container (cross-node clones refused for `dont-move` tagged guests) |
+| `clone_guest` | Clone a VM or container (cross-node clones refused for guests carrying the no-migrate tag) |
 | `set_guest_config` | Modify VM/container settings (CPU, memory, swap (LXC), name, onboot) |
 
 ### Migration
@@ -153,6 +161,13 @@ Two things that make a client look broken when the server is fine:
 
 `bandwidth` is given in **MB/s** on both tools and is converted to PVE's KiB/s
 `bwlimit` internally.
+
+**Protected guests.** `migrate_guest` refuses, and `drain_node` skips, any guest
+carrying the no-migrate tag — `dont-move` by default, or whatever you set
+`PROXMOX_NO_MIGRATE_TAG` to. Matching ignores case. The check is *fail-closed*:
+if a guest's config cannot be read, it is refused rather than moved, and
+`drain_node` reports it as a guest that would leave the node not fully
+evacuated.
 
 **Run state is preserved.** A guest ends a migration in the state it started in,
 and a guest never needs to be started or stopped first:

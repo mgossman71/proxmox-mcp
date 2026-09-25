@@ -161,7 +161,7 @@ export function registerProvisioningTools(server: McpServer): void {
       const info = await getGuestInfo(vmid);
       const target = target_node ?? node;
 
-      // Block cross-node clones of dont-move tagged guests
+      // Block cross-node clones of guests carrying the no-migrate tag
       if (target !== info.node) {
         await assertMovable(info.node, info.type, vmid, info.name);
       }
