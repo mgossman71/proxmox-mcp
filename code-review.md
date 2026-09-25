@@ -1,9 +1,11 @@
 # Code Review: Proxmox MCP Server
 
-> **Two rounds in this file.** Round 1 (below) covers the 23-tool tree and was
+> **Three rounds in this file.** Round 1 (below) covers the 23-tool tree and was
 > resolved in `407d367`. Round 2 covers the `live-migrate` migration work and is
 > **resolved** — jump to [Code Review — `live-migrate` branch](#code-review--live-migrate-branch-2026-09-25)
-> and [Remediation](#remediation-2026-09-25).
+> and [Remediation](#remediation-2026-09-25). Round 3 covers two defects found by
+> running the server against a live cluster — see
+> [Follow-up from live testing](#follow-up-from-live-testing-2026-09-25).
 
 ## Overview
 
@@ -533,3 +535,76 @@ pvesh usage /nodes/{node}/lxc/{vmid}/clone
 
 The clone fallback in particular has never been exercised against a cluster that
 actually lacks the LXC migrate endpoint — only against the mock.
+
+---
+
+# Follow-up from live testing (2026-09-25)
+
+Two defects surfaced after the round-2 remediation, both found by running the
+server against a real cluster rather than by review.
+
+## 11. `migrate_guest` claimed a guest must be running — it never did
+
+The tool description ended with *"The guest must currently be running on the
+source node."* Nothing in the code enforced it, and PVE migrates stopped guests
+perfectly well. The only effect was on callers: an MCP client, asked to migrate
+a stopped container (132 on `pve3`), read the description and decided to start
+the container first. That is downtime for no reason.
+
+The line predated the round-2 work (it came in with `316ac4f`), but it was
+covering for a real bug that finding 2 had just introduced. Once `online`
+stopped defaulting to `false`, a stopped guest was sent `online=1` (QEMU) or
+`restart=1` (LXC) — both of which describe a *running* guest.
+
+## 12. Run state was not preserved across a migration
+
+Fixing #11 exposed the larger question of what a migration should guarantee.
+The contract is now explicit: **a guest ends a migration in the state it started
+in.**
+
+| Guest was | What happens | Guest ends up |
+|-----------|--------------|---------------|
+| Stopped | Moved offline | Stopped on the target |
+| Running, live migration possible | Live migrated | Running, no downtime |
+| Running, live migration not possible | Shut down → moved → started | Running, brief downtime |
+
+Only the first two cases worked before. Specifically:
+
+- **QEMU, live migration impossible** (local devices, CPU mismatch, unshared
+  storage) simply failed and left the guest where it was. It now falls back to
+  shutdown → offline move → start on the target.
+- **QEMU with `online: false` on a running VM** failed outright, because PVE
+  rejects `online=0` for a running guest. `online` now means "attempt live
+  migration", not "leave it switched off" — a running VM ends up running either
+  way.
+- **LXC with `online: true`** had no fallback when live migration failed. It now
+  retries with `restart=1`, which is PVE's own shutdown/move/start. A *missing
+  endpoint* is still routed to the clone fallback rather than being mistaken for
+  a live-migration failure.
+- **The clone fallback started the clone unconditionally**, so a stopped
+  container came back up running on the target. It now starts the clone only if
+  the original was running. This was introduced by the finding 1 resequencing.
+
+Failure handling was not specified by the request and is a judgment call: if the
+move fails *after* the guest has been shut down, the guest is started again on
+the source so it is left as it was found. If that restart also fails, the error
+names the node the guest is stopped on instead of leaving it unexplained.
+
+## 13. The migration test mock kept its own `resolveGuest`
+
+`tests/migration.test.ts` reimplements `resolveGuest` inside its
+`vi.mock` factory. When the real one gained a `running` field, the copy did not,
+and every migration became offline in tests while staying correct in production
+— the same mock-drift class as finding 8. The copy now mirrors the real
+function, but it remains a standing trap and is worth collapsing onto the real
+implementation.
+
+## Status
+
+`npx tsc --noEmit` clean, **193 tests pass** (up from 182 at the end of round 2),
+coverage still at the configured **100%** threshold for statements, branches,
+functions and lines.
+
+Still unproven against real hardware: whether PVE rejects or merely warns for the
+cases that now trigger the shutdown path, and the clone fallback generally, which
+has still only ever run against the mock.
