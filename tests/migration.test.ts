@@ -321,6 +321,35 @@ describe("migration tools", () => {
       expect(result.content[0].text).toContain("Migrated qemu VMID 100");
     });
 
+    // A client once read a bare "Migrated ..." line, decided the container must
+    // have been running, and called start_guest to "restore" it. The output has
+    // to state the run state so there is nothing left to infer.
+    it("should say explicitly that a stopped guest was left stopped", async () => {
+      mockPvesh
+        .mockRejectedValueOnce(new Error("nf"))
+        .mockResolvedValueOnce({ status: "stopped" })  // lxc, stopped
+        .mockResolvedValueOnce({ tags: "" })
+        .mockResolvedValueOnce("UPID:pve:1:move");
+      mockWaitForTask.mockResolvedValue(undefined);
+
+      const result = await server.tools["migrate_guest"]({
+        node: "pve3",
+        vmid: 132,
+        target_node: "pve2",
+      });
+
+      const text = result.content[0].text;
+      expect(text).toContain("Run state preserved");
+      expect(text).toContain("STOPPED");
+      expect(text).toContain("pve2");
+      expect(text).toMatch(/do not start it/i);
+      // And nothing was started.
+      const starts = mockPvesh.mock.calls.filter((c) =>
+        String(c[1]).endsWith("/status/start")
+      );
+      expect(starts).toHaveLength(0);
+    });
+
     it("should ignore online=true for a stopped QEMU VM", async () => {
       mockPvesh
         .mockResolvedValueOnce({ status: "stopped" })
@@ -401,7 +430,8 @@ describe("migration tools", () => {
         .toBeLessThan(order.lastIndexOf("create /nodes/pve/qemu/100/migrate"));
       expect(order.lastIndexOf("create /nodes/pve/qemu/100/migrate"))
         .toBeLessThan(order.indexOf("create /nodes/node2/qemu/100/status/start"));
-      expect(result.content[0].text).toContain("It is running");
+      expect(result.content[0].text).toContain("is RUNNING on 'node2'");
+      expect(result.content[0].text).toContain("Run state preserved");
     });
 
     it("should not attempt live migration when online=false, but still end up running", async () => {

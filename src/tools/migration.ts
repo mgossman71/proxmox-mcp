@@ -354,7 +354,9 @@ export function registerMigrationTools(server: McpServer): void {
         "The guest's run state is preserved: a stopped guest is moved offline " +
         "and left stopped, and a running guest ends up running on the target — " +
         "live-migrated if possible, otherwise shut down, moved and started " +
-        "again. There is no need to start or stop a guest first.",
+        "again. There is no need to start or stop a guest before or after " +
+        "calling this — do not issue start_guest or stop_guest to 'restore' a " +
+        "guest's run state, as it is already preserved.",
       inputSchema: {
         node: nodeParam,
         vmid: vmidParam,
@@ -394,10 +396,25 @@ export function registerMigrationTools(server: McpServer): void {
           ? `OK: Migrated ${type} VMID ${vmid} → ${result.newVmid} (clone) from '${guestNode}' to '${target_node}'.`
           : `OK: Migrated ${type} VMID ${vmid} from '${guestNode}' to '${target_node}'.`;
 
-      if (result.restarted) {
+      // Say the run state outright. Without this the caller only sees "migrated"
+      // and may decide for itself that the guest needs starting -- which is how
+      // a deliberately-stopped guest gets "restored" into running.
+      const moved = result.newVmid !== vmid ? result.newVmid : vmid;
+      if (running && result.restarted) {
         text +=
-          `\nNOTE: live migration was not possible, so ${vmid} was shut down, ` +
-          `moved, and started again on '${target_node}'. It is running.`;
+          `\nRun state preserved: ${vmid} was running, and live migration was ` +
+          `not possible, so it was shut down, moved, and started again. ` +
+          `${moved} is RUNNING on '${target_node}'.`;
+      } else if (running) {
+        text +=
+          `\nRun state preserved: ${vmid} was running and was live migrated. ` +
+          `${moved} is RUNNING on '${target_node}'. There was no downtime.`;
+      } else {
+        text +=
+          `\nRun state preserved: ${vmid} was STOPPED before the migration and ` +
+          `is STOPPED on '${target_node}'. This is deliberate — it was moved ` +
+          `offline and intentionally not started. Do not start it to "restore" ` +
+          `it; it is already in the state it was found in.`;
       }
 
       if (result.originalRetained) {
@@ -571,10 +588,13 @@ export function registerMigrationTools(server: McpServer): void {
             target_storage,
             online
           );
+          const state = g.running ? "running" : "stopped";
           if (result.newVmid !== g.vmid) {
-            migrated.push(`${g.vmid} → ${result.newVmid} (${g.type}) "${g.name}" [clone]`);
+            migrated.push(
+              `${g.vmid} → ${result.newVmid} (${g.type}) "${g.name}" [clone] — ${state}`
+            );
           } else {
-            migrated.push(`${g.vmid} (${g.type}) "${g.name}"`);
+            migrated.push(`${g.vmid} (${g.type}) "${g.name}" — ${state}`);
           }
           if (result.originalRetained) retained.push(g.vmid);
         } catch (err: any) {
@@ -596,7 +616,9 @@ export function registerMigrationTools(server: McpServer): void {
 
       if (migrated.length > 0) {
         summary.push("");
-        summary.push("  Successfully migrated:");
+        summary.push("  Successfully migrated (run state preserved — each guest");
+        summary.push("  is in the state shown, which is the state it started in;");
+        summary.push("  do not start or stop any of them to 'restore' them):");
         for (const m of migrated) {
           summary.push(`    ✓ ${m}`);
         }
