@@ -38,9 +38,29 @@ PROXMOX_SSH_HOST=10.0.0.19
 PROXMOX_SSH_USER=root
 PROXMOX_SSH_KEY=~/.ssh/id_rsa
 MCP_PORT=3000
+
+# Optional but strongly recommended — see Authentication below.
+MCP_AUTH_TOKEN=some-long-random-string
 ```
 
-### 3. Run
+`MCP_PORT` is the **host** port; the container always listens on 3000 internally.
+
+### 3. Authentication
+
+`/mcp` is protected by a shared-secret Bearer token. Set `MCP_AUTH_TOKEN` and
+every request must carry `Authorization: Bearer <token>`; anything else gets a
+401.
+
+**If `MCP_AUTH_TOKEN` is unset the endpoint is completely unauthenticated** —
+anyone who can reach the port can create and destroy guests on your cluster. The
+server logs a warning at startup when this is the case. It is left optional so
+local development stays frictionless, but do not run it this way on a network
+you do not trust.
+
+`/health` is deliberately left open so orchestrators can probe it without
+credentials.
+
+### 4. Run
 
 ```bash
 docker compose up -d
@@ -53,29 +73,34 @@ curl http://localhost:3000/health
 # {"status":"ok","service":"proxmox-mcp"}
 ```
 
-### 4. Connect MCP Client
+### 5. Connect MCP Client
 
-**Cline / VS Code:**
+**Cline / VS Code** and **Claude Desktop** use the same shape:
+
 ```json
 {
   "mcpServers": {
     "proxmox": {
-      "url": "http://localhost:3000/mcp"
+      "url": "http://localhost:3000/mcp",
+      "headers": {
+        "Authorization": "Bearer some-long-random-string"
+      }
     }
   }
 }
 ```
 
-**Claude Desktop:**
-```json
-{
-  "mcpServers": {
-    "proxmox": {
-      "url": "http://localhost:3000/mcp"
-    }
-  }
-}
-```
+Drop the `headers` block if `MCP_AUTH_TOKEN` is unset.
+
+Two things that make a client look broken when the server is fine:
+
+- **`Accept` header.** Streamable HTTP requires the client to accept *both*
+  `application/json` and `text/event-stream`. Sending only the former gets
+  `406 Not Acceptable`.
+- **Stale session after a restart.** Sessions are held in memory, so restarting
+  the server invalidates every session ID. A client reusing an old one gets
+  `400 Bad Request: Server not initialized` and must re-initialize — restart the
+  client, do not just retry.
 
 ## Tools
 
@@ -148,6 +173,19 @@ If the move fails after the guest has been shut down, it is started again on the
 source node so it is left as it was found. If that restart also fails, the tool
 says so explicitly and names the node it is stopped on.
 
+The tool output always names the run state on both sides, for example:
+
+```
+OK: Migrated lxc VMID 132 from 'pve3' to 'pve2'.
+Run state preserved: 132 was STOPPED before the migration and is STOPPED on
+'pve2'. This is deliberate — it was moved offline and intentionally not
+started. Do not start it to "restore" it; it is already in the state it was
+found in.
+```
+
+Do **not** follow a migration with `start_guest` or `stop_guest` to "restore"
+a guest — the state you found it in is the state it is left in.
+
 On PVE versions without the native LXC migrate endpoint, `migrate_guest` falls
 back to a clone: the source container is **stopped first**, cloned to the target
 under a new VMID, and the clone is started there **only if the original was
@@ -159,7 +197,15 @@ original are named in the tool's output.
 
 ```bash
 npm install
-npm run dev        # run with tsx (no build step)
-npm run build      # compile TypeScript
-npm start          # run compiled output
+npm run dev            # run with tsx (no build step)
+npm run build          # compile TypeScript
+npm start              # run compiled output
+npm test               # vitest, single run
+npm run test:coverage  # vitest with coverage
 ```
+
+Coverage is enforced at **100%** for statements, branches, functions and lines
+(`src/index.ts` excluded); `npm run test:coverage` fails below that.
+
+Test discovery excludes `.claude/`, since git worktrees created there would
+otherwise have their copy of every suite collected alongside the real one.
