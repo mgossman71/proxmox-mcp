@@ -114,17 +114,20 @@ async function performMigration(
   vmid: number,
   target: string,
   bandwidth: number,
+  running: boolean,
   targetStorage?: string,
   online?: boolean
 ): Promise<MigrationResult> {
   const bwlimit = bandwidth * KIB_PER_MB;
 
   if (type === "qemu") {
+    // A stopped VM can only migrate offline -- asking PVE to live-migrate one
+    // is an error. `online` is therefore a preference that applies to running
+    // guests only: live by default, and an explicit false opts out.
     const params: Record<string, string | number | boolean> = {
       target,
       bwlimit,
-      // QEMU migration defaults to live/online; only an explicit false opts out.
-      online: online === false ? 0 : 1,
+      online: running && online !== false ? 1 : 0,
     };
     if (targetStorage) params.targetstorage = targetStorage;
     const result = await pvesh(
@@ -143,10 +146,14 @@ async function performMigration(
       target,
       bwlimit,
     };
-    if (online) {
-      params.online = 1;
-    } else {
-      params.restart = 1;
+    // Both flags describe what to do with a *running* container. A stopped one
+    // migrates plainly, and sending either would have PVE reject the request.
+    if (running) {
+      if (online) {
+        params.online = 1;
+      } else {
+        params.restart = 1;
+      }
     }
     if (targetStorage) params["target-storage"] = targetStorage;
     const result = await pvesh(
@@ -236,8 +243,9 @@ const onlineParam = z
   .boolean()
   .optional()
   .describe(
-    "Use live/online migration. Defaults to online for QEMU (no downtime) and " +
-      "to restart for LXC (brief downtime; LXC live migration is experimental)."
+    "How to move a *running* guest: live by default for QEMU (no downtime), " +
+      "restart-on-target for LXC (brief downtime; LXC live migration is " +
+      "experimental). Ignored for stopped guests, which always migrate offline."
   );
 
 export function registerMigrationTools(server: McpServer): void {
@@ -247,9 +255,11 @@ export function registerMigrationTools(server: McpServer): void {
     {
       title: "Migrate Guest",
       description:
-        "Live migrate a QEMU VM or LXC container to another cluster node. " +
+        "Migrate a QEMU VM or LXC container to another cluster node. " +
         "Refuses to migrate guests tagged with 'dont-move'. " +
-        "The guest must currently be running on the source node.",
+        "Works whether the guest is running or stopped: a running guest is " +
+        "migrated live (QEMU) or restarted on the target (LXC), and a stopped " +
+        "guest is migrated offline. There is no need to start a guest first.",
       inputSchema: {
         node: nodeParam,
         vmid: vmidParam,
@@ -263,7 +273,7 @@ export function registerMigrationTools(server: McpServer): void {
       },
     },
     async ({ node, vmid, target_node, bandwidth, target_storage, online }) => {
-      const { node: guestNode, type } = await resolveGuest(node, vmid);
+      const { node: guestNode, type, running } = await resolveGuest(node, vmid);
 
       if (guestNode === target_node) {
         throw new ProxmoxError(
@@ -279,6 +289,7 @@ export function registerMigrationTools(server: McpServer): void {
         vmid,
         target_node,
         bandwidth,
+        running,
         target_storage,
         online
       );
@@ -341,12 +352,22 @@ export function registerMigrationTools(server: McpServer): void {
       const qemuList = await pvesh("get", `/nodes/${source_node}/qemu`);
       const lxcList = await pvesh("get", `/nodes/${source_node}/lxc`);
 
-      const guests: { vmid: number; type: "qemu" | "lxc"; name: string }[] = [];
+      const guests: {
+        vmid: number;
+        type: "qemu" | "lxc";
+        name: string;
+        running: boolean;
+      }[] = [];
 
       if (Array.isArray(qemuList)) {
         for (const vm of qemuList) {
           if (typeof vm.vmid === "number" && vm.vmid > 0) {
-            guests.push({ vmid: vm.vmid, type: "qemu", name: vm.name || `vm-${vm.vmid}` });
+            guests.push({
+              vmid: vm.vmid,
+              type: "qemu",
+              name: vm.name || `vm-${vm.vmid}`,
+              running: vm.status === "running",
+            });
           }
         }
       }
@@ -354,7 +375,12 @@ export function registerMigrationTools(server: McpServer): void {
       if (Array.isArray(lxcList)) {
         for (const ct of lxcList) {
           if (typeof ct.vmid === "number" && ct.vmid > 0) {
-            guests.push({ vmid: ct.vmid, type: "lxc", name: ct.name || `ct-${ct.vmid}` });
+            guests.push({
+              vmid: ct.vmid,
+              type: "lxc",
+              name: ct.name || `ct-${ct.vmid}`,
+              running: ct.status === "running",
+            });
           }
         }
       }
@@ -439,6 +465,7 @@ export function registerMigrationTools(server: McpServer): void {
             g.vmid,
             target_node,
             bandwidth,
+            g.running,
             target_storage,
             online
           );

@@ -156,7 +156,7 @@ export async function pvesh(
  */
 export async function getGuestInfo(
   vmid: number
-): Promise<{ node: string; type: "qemu" | "lxc"; name: string }> {
+): Promise<{ node: string; type: "qemu" | "lxc"; name: string; running: boolean }> {
   const resources = await pvesh("get", "/cluster/resources");
   if (!Array.isArray(resources)) {
     throw new ProxmoxError("Unexpected (non-array) response from /cluster/resources");
@@ -171,6 +171,7 @@ export async function getGuestInfo(
     node: match.node,
     type: match.type,
     name: match.name,
+    running: match.status === "running",
   };
 }
 
@@ -195,6 +196,8 @@ export async function getNextVmid(): Promise<number> {
 export interface GuestLocation {
   node: string;
   type: "qemu" | "lxc";
+  /** True when the guest is currently running. Drives live vs offline migration. */
+  running: boolean;
 }
 
 /**
@@ -209,17 +212,21 @@ export async function resolveGuest(
   vmid: number
 ): Promise<GuestLocation> {
   try {
-    await pvesh("get", `/nodes/${node}/qemu/${vmid}/status/current`);
-    return { node, type: "qemu" };
+    const status = asObject(
+      await pvesh("get", `/nodes/${node}/qemu/${vmid}/status/current`)
+    );
+    return { node, type: "qemu", running: status?.status === "running" };
   } catch { /* not a QEMU VM on this node */ }
 
   try {
-    await pvesh("get", `/nodes/${node}/lxc/${vmid}/status/current`);
-    return { node, type: "lxc" };
+    const status = asObject(
+      await pvesh("get", `/nodes/${node}/lxc/${vmid}/status/current`)
+    );
+    return { node, type: "lxc", running: status?.status === "running" };
   } catch { /* not an LXC container on this node */ }
 
   const info = await getGuestInfo(vmid);
-  return { node: info.node, type: info.type };
+  return { node: info.node, type: info.type, running: info.running };
 }
 
 /**

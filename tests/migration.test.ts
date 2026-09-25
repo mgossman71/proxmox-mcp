@@ -15,17 +15,20 @@ vi.mock("../src/proxmox.js", () => {
     }
   }
 
+  // Mirrors the real resolveGuest, including the run state it derives from the
+  // status call -- migration mode depends on it, so the mock must not drift.
+  const isRunning = (s: any) => (s as any)?.status === "running";
   async function resolveGuest(node: string, vmid: number) {
     try {
-      await pvesh("get", `/nodes/${node}/qemu/${vmid}/status/current`);
-      return { node, type: "qemu" as const };
+      const s = await pvesh("get", `/nodes/${node}/qemu/${vmid}/status/current`);
+      return { node, type: "qemu" as const, running: isRunning(s) };
     } catch { /* not qemu */ }
     try {
-      await pvesh("get", `/nodes/${node}/lxc/${vmid}/status/current`);
-      return { node, type: "lxc" as const };
+      const s = await pvesh("get", `/nodes/${node}/lxc/${vmid}/status/current`);
+      return { node, type: "lxc" as const, running: isRunning(s) };
     } catch { /* not lxc */ }
     const info = await getGuestInfo(vmid);
-    return { node: info.node, type: info.type };
+    return { node: info.node, type: info.type, running: info.running };
   }
 
   return {
@@ -288,6 +291,83 @@ describe("migration tools", () => {
       );
     });
 
+    // A stopped guest is migrated offline. The tool used to advertise that a
+    // guest "must currently be running", which led callers to start a stopped
+    // guest first -- unnecessary downtime for no reason.
+    it("should migrate a stopped QEMU VM offline, without starting it", async () => {
+      mockPvesh
+        .mockResolvedValueOnce({ status: "stopped" }) // resolveGuest: qemu, stopped
+        .mockResolvedValueOnce({ tags: "" })
+        .mockResolvedValueOnce("UPID:pve:1:migrate");
+      mockWaitForTask.mockResolvedValue(undefined);
+
+      const result = await server.tools["migrate_guest"]({
+        node: "pve",
+        vmid: 100,
+        target_node: "node2",
+      });
+
+      expect(mockPvesh).toHaveBeenCalledWith(
+        "create",
+        "/nodes/pve/qemu/100/migrate",
+        { target: "node2", bwlimit: 153600, online: 0 },
+        600000
+      );
+      // Nothing is started on the caller's behalf.
+      const starts = mockPvesh.mock.calls.filter((c) =>
+        String(c[1]).endsWith("/status/start")
+      );
+      expect(starts).toHaveLength(0);
+      expect(result.content[0].text).toContain("Migrated qemu VMID 100");
+    });
+
+    it("should ignore online=true for a stopped QEMU VM", async () => {
+      mockPvesh
+        .mockResolvedValueOnce({ status: "stopped" })
+        .mockResolvedValueOnce({ tags: "" })
+        .mockResolvedValueOnce("UPID:pve:1:migrate");
+      mockWaitForTask.mockResolvedValue(undefined);
+
+      await server.tools["migrate_guest"]({
+        node: "pve",
+        vmid: 100,
+        target_node: "node2",
+        online: true,
+      });
+
+      // PVE rejects a live migration of a VM that is not running, so the
+      // preference cannot be honoured literally.
+      expect(mockPvesh).toHaveBeenCalledWith(
+        "create",
+        "/nodes/pve/qemu/100/migrate",
+        { target: "node2", bwlimit: 153600, online: 0 },
+        600000
+      );
+    });
+
+    it("should send neither restart nor online for a stopped LXC container", async () => {
+      mockPvesh
+        .mockRejectedValueOnce(new Error("nf"))        // resolveGuest: qemu fails
+        .mockResolvedValueOnce({ status: "stopped" })  // resolveGuest: lxc, stopped
+        .mockResolvedValueOnce({ tags: "" })
+        .mockResolvedValueOnce("UPID:pve:1:move");
+      mockWaitForTask.mockResolvedValue(undefined);
+
+      await server.tools["migrate_guest"]({
+        node: "pve",
+        vmid: 132,
+        target_node: "node2",
+      });
+
+      // Both flags describe what to do with a running container.
+      expect(mockPvesh).toHaveBeenCalledWith(
+        "create",
+        "/nodes/pve/lxc/132/migrate",
+        { target: "node2", bwlimit: 153600 },
+        600000
+      );
+    });
+
     it("should use PVE's hyphenated target-storage on the LXC endpoint", async () => {
       mockPvesh
         .mockRejectedValueOnce(new Error("nf"))
@@ -480,6 +560,40 @@ describe("migration tools", () => {
       });
 
       expect(result.content[0].text).toContain("has no guests to drain");
+    });
+
+    // drain reads run state from the node listings, so a half-stopped node is
+    // drained with the right mode per guest rather than one mode for all.
+    it("should drain running and stopped guests with the right mode each", async () => {
+      mockPvesh
+        .mockResolvedValueOnce([
+          { vmid: 100, name: "web", status: "running" },
+          { vmid: 101, name: "archive", status: "stopped" },
+        ])
+        .mockResolvedValueOnce([]) // no lxc
+        .mockResolvedValueOnce({ tags: "" })          // 100 tags
+        .mockResolvedValueOnce({ tags: "" })          // 101 tags
+        .mockResolvedValueOnce("UPID:pve:1:migrate")  // 100 migrate
+        .mockResolvedValueOnce("UPID:pve:2:migrate"); // 101 migrate
+      mockWaitForTask.mockResolvedValue(undefined);
+
+      await server.tools["drain_node"]({
+        source_node: "pve",
+        target_node: "node2",
+      });
+
+      expect(mockPvesh).toHaveBeenCalledWith(
+        "create",
+        "/nodes/pve/qemu/100/migrate",
+        { target: "node2", bwlimit: 153600, online: 1 },
+        600000
+      );
+      expect(mockPvesh).toHaveBeenCalledWith(
+        "create",
+        "/nodes/pve/qemu/101/migrate",
+        { target: "node2", bwlimit: 153600, online: 0 },
+        600000
+      );
     });
 
     it("should report failed migration when config read returns null (fail-closed)", async () => {

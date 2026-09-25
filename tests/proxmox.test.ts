@@ -202,22 +202,26 @@ describe("pvesh", () => {
 describe("getGuestInfo", () => {
   it("should find a QEMU VM in the cluster", async () => {
     const resources = [
-      { vmid: 100, type: "qemu", name: "MyVM", node: "pve" },
-      { vmid: 101, type: "lxc", name: "MyCT", node: "pve" },
+      { vmid: 100, type: "qemu", name: "MyVM", node: "pve", status: "running" },
+      { vmid: 101, type: "lxc", name: "MyCT", node: "pve", status: "running" },
     ];
     mockSshSuccess(JSON.stringify(resources));
     const result = await getGuestInfo(100);
-    expect(result).toEqual({ node: "pve", type: "qemu", name: "MyVM" });
+    expect(result).toEqual({
+      node: "pve", type: "qemu", name: "MyVM", running: true,
+    });
   });
 
   it("should find an LXC container in the cluster", async () => {
     const resources = [
-      { vmid: 100, type: "qemu", name: "MyVM", node: "pve" },
-      { vmid: 101, type: "lxc", name: "MyCT", node: "pve2" },
+      { vmid: 100, type: "qemu", name: "MyVM", node: "pve", status: "running" },
+      { vmid: 101, type: "lxc", name: "MyCT", node: "pve2", status: "stopped" },
     ];
     mockSshSuccess(JSON.stringify(resources));
     const result = await getGuestInfo(101);
-    expect(result).toEqual({ node: "pve2", type: "lxc", name: "MyCT" });
+    expect(result).toEqual({
+      node: "pve2", type: "lxc", name: "MyCT", running: false,
+    });
   });
 
   it("should throw when VMID not found", async () => {
@@ -458,7 +462,7 @@ describe("resolveGuest", () => {
   it("should find QEMU VM on the specified node", async () => {
     mockSshSuccess(JSON.stringify({ status: "running" }));
     const result = await resolveGuest("pve", 100);
-    expect(result).toEqual({ node: "pve", type: "qemu" });
+    expect(result).toEqual({ node: "pve", type: "qemu", running: true });
     expect(mockExecFile).toHaveBeenCalledTimes(1);
   });
 
@@ -484,7 +488,7 @@ describe("resolveGuest", () => {
       }
     );
     const result = await resolveGuest("pve", 101);
-    expect(result).toEqual({ node: "pve", type: "lxc" });
+    expect(result).toEqual({ node: "pve", type: "lxc", running: true });
     expect(callCount).toBe(2);
   });
 
@@ -502,7 +506,7 @@ describe("resolveGuest", () => {
           // cluster/resources response
           callback(null, {
             stdout: JSON.stringify([
-              { vmid: 200, type: "qemu", name: "RemoteVM", node: "node2" },
+              { vmid: 200, type: "qemu", name: "RemoteVM", node: "node2", status: "running" },
             ]),
             stderr: "",
           });
@@ -510,7 +514,7 @@ describe("resolveGuest", () => {
       }
     );
     const result = await resolveGuest("pve", 200);
-    expect(result).toEqual({ node: "node2", type: "qemu" });
+    expect(result).toEqual({ node: "node2", type: "qemu", running: true });
   });
 });
 
