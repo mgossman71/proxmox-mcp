@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
+import { z } from "zod";
 vi.mock("../src/proxmox.js", () => {
   const pvesh = vi.fn();
   const getGuestInfo = vi.fn();
@@ -56,8 +57,12 @@ function createMockServer() {
   const tools: Record<string, any> = {};
   return {
     tools,
-    registerTool(name: string, _meta: any, handler: any) {
-      tools[name] = handler;
+    registerTool(name: string, meta: any, handler: any) {
+      // Apply the tool's own inputSchema the way the MCP SDK does, so every
+      // `.default()` is exercised and tests see the values production sees.
+      const schema = meta?.inputSchema ? z.object(meta.inputSchema) : null;
+      tools[name] = async (args: any = {}) =>
+        handler(schema ? schema.parse(args) : args);
     },
   } as any;
 }
@@ -342,7 +347,7 @@ describe("provisioning tools", () => {
 
       expect(mockPvesh).toHaveBeenCalledWith(
         "create", "/nodes/pve/qemu/100/clone",
-        { name: "CloneVM", target: "pve", vmid: 115 },
+        { name: "CloneVM", target: "pve", newid: 115 },
         300000
       );
       expect(mockWaitForTask).toHaveBeenCalledWith("pve", "UPID:pve:clone:115:1:");
@@ -361,7 +366,7 @@ describe("provisioning tools", () => {
 
       expect(mockPvesh).toHaveBeenCalledWith(
         "create", "/nodes/pve/lxc/101/clone",
-        { name: "CloneCT", target: "pve", vmid: 116 },
+        { hostname: "CloneCT", target: "pve", newid: 116 },
         300000
       );
     });
@@ -392,7 +397,7 @@ describe("provisioning tools", () => {
 
       expect(mockPvesh).toHaveBeenCalledWith(
         "create", "/nodes/pve/lxc/101/clone",
-        { target: "pve", name: "LinkedCT", vmid: 121, snapshot: "current" },
+        { target: "pve", hostname: "LinkedCT", newid: 121, snapshot: "current" },
         300000
       );
     });
@@ -407,7 +412,22 @@ describe("provisioning tools", () => {
       });
 
       expect(mockGetNextVmid).not.toHaveBeenCalled();
-      expect(mockPvesh.mock.calls[0][2].vmid).toBe(300);
+      expect(mockPvesh.mock.calls[0][2].newid).toBe(300);
+    });
+
+    it("should refuse a cross-node clone of a dont-move guest, naming it", async () => {
+      mockGetNextVmid.mockResolvedValue(119);
+      mockGetGuestInfo.mockResolvedValue({ node: "pve", type: "qemu", name: "Anchored" });
+      mockPvesh.mockResolvedValueOnce({ tags: "infra;dont-move" });
+
+      await expect(
+        server.tools["clone_guest"]({
+          node: "pve", vmid: 100, new_name: "Copy", target_node: "node2",
+        })
+      ).rejects.toThrow("'Anchored'");
+
+      const creates = mockPvesh.mock.calls.filter((c) => c[0] === "create");
+      expect(creates).toHaveLength(0);
     });
 
     it("should use target_node if specified", async () => {
@@ -421,7 +441,10 @@ describe("provisioning tools", () => {
       });
 
       expect(mockPvesh.mock.calls[1][2].target).toBe("node2");
-      expect(mockWaitForTask).toHaveBeenCalledWith("node2", null);
+      // The clone task is owned by the source node, so it is polled there,
+      // not on the target (which cannot report another node's UPID).
+      expect(mockPvesh.mock.calls[1][1]).toBe("/nodes/pve/qemu/100/clone");
+      expect(mockWaitForTask).toHaveBeenCalledWith("pve", null);
     });
 
     it("should propagate task errors", async () => {

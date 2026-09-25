@@ -2,7 +2,8 @@
 
 > **Two rounds in this file.** Round 1 (below) covers the 23-tool tree and was
 > resolved in `407d367`. Round 2 covers the `live-migrate` migration work and is
-> open — jump to [Code Review — `live-migrate` branch](#code-review--live-migrate-branch-2026-09-25).
+> **resolved** — jump to [Code Review — `live-migrate` branch](#code-review--live-migrate-branch-2026-09-25)
+> and [Remediation](#remediation-2026-09-25).
 
 ## Overview
 
@@ -489,3 +490,46 @@ not introduced by this branch.
 5. **Findings 5, 6, 10, 4** — confirm against `pvesh usage` on the live cluster,
    then correct together.
 6. **Findings 7, 9** — small, independent.
+
+
+---
+
+# Remediation (2026-09-25)
+
+All ten round-2 findings are addressed. `npx tsc --noEmit` is clean, **182 tests
+pass** (up from 166), and coverage is back at the configured **100%** threshold
+for statements, branches, functions and lines.
+
+| # | Finding | Resolution |
+|---|---------|------------|
+| 8 | Test mock bypasses zod | `createMockServer` now runs `z.object(meta.inputSchema).parse(args)` before calling the handler, in all five tool test files — not just `migration.test.ts`. The wrapper is `async`, so schema rejections surface as rejected promises the way the SDK delivers them. |
+| 2 | Default migration was offline | `online` dropped its `.default(false)` and is now `.optional()`. `undefined` means "caller did not choose", so QEMU defaults to live and LXC to restart — which is what the tool descriptions always claimed. |
+| 1 | Clone fallback ran two copies, then deleted the original | Resequenced to **stop original → clone → start clone**. The two containers are never live at once, the clone is taken from a stopped source, and the original is **no longer deleted** — it is left stopped and reported in the tool output. This restores the README's "no destructive guest deletion" scope note. |
+| 3 | Clone task awaited on the wrong node | Clone UPIDs are now polled on the **source** node that owns them, in both `migration.ts` and `provisioning.ts`. |
+| 4 | `bwlimit` unit disagreed by 1024x | Both branches now convert MB/s → KiB/s through a single `KIB_PER_MB` constant. |
+| 5 | Wrong `target_storage` spelling | Now `targetstorage` on the QEMU migrate endpoint and `target-storage` on the LXC one. |
+| 6 | LXC clone used QEMU spellings | LXC clone now sends `newid` + `hostname` (never `vmid`, which is the path parameter); target storage is `storage`. `clone_guest` in `provisioning.ts` was corrected the same way. |
+| 7 | `dry_run` silently dropped failed guests | The dry-run report gained a "Cannot determine — tag check failed" section plus an explicit warning that the node would not be fully evacuated. |
+| 9 | `bandwidth: 0` meant unlimited | `bandwidthParam` is now `.int().positive()`, shared by both tools. Since zod always supplies the default, the dead `bandwidth ?? 150` fallback inside `performMigration` was removed. |
+| 10 | Fallback trigger matched text PVE does not emit | Replaced with `isEndpointMissing()`, which matches a list of missing-endpoint fragments (including `not implemented`, `no such resource` and `501`) case-insensitively against both the message and any captured `stderr`. |
+
+Also fixed, from "Adjacent, pre-existing": `clone_guest` issued its clone against
+`/nodes/${node}/...` while the `dont-move` guard read `info.node`. It now uses
+`info.node` for both, so cloning a guest that is not on the default node builds
+the right API path.
+
+## Still worth confirming on the live cluster
+
+Findings 4, 5, 6 and 10 were marked PLAUSIBLE because they depend on the real PVE
+API contract. They have been corrected to the documented PVE parameter names and
+units, but that is not the same as observing them work. Before relying on a
+production drain, confirm:
+
+```
+pvesh usage /nodes/{node}/qemu/{vmid}/migrate
+pvesh usage /nodes/{node}/lxc/{vmid}/migrate
+pvesh usage /nodes/{node}/lxc/{vmid}/clone
+```
+
+The clone fallback in particular has never been exercised against a cluster that
+actually lacks the LXC migrate endpoint — only against the mock.

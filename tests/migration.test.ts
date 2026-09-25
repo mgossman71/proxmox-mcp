@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
+import { z } from "zod";
 vi.mock("../src/proxmox.js", () => {
   const pvesh = vi.fn();
   const getGuestInfo = vi.fn();
@@ -54,8 +55,12 @@ function createMockServer() {
   const tools: Record<string, any> = {};
   return {
     tools,
-    registerTool(name: string, _meta: any, handler: any) {
-      tools[name] = handler;
+    registerTool(name: string, meta: any, handler: any) {
+      // Apply the tool's own inputSchema the way the MCP SDK does, so every
+      // `.default()` is exercised and tests see the values production sees.
+      const schema = meta?.inputSchema ? z.object(meta.inputSchema) : null;
+      tools[name] = async (args: any = {}) =>
+        handler(schema ? schema.parse(args) : args);
     },
   } as any;
 }
@@ -95,7 +100,7 @@ describe("migration tools", () => {
       expect(mockPvesh).toHaveBeenCalledWith(
         "create",
         "/nodes/pve/qemu/100/migrate",
-        { target: "node2", bwlimit: 150, online: 1 },
+        { target: "node2", bwlimit: 153600, online: 1 },
         600000
       );
       expect(mockWaitForTask).toHaveBeenCalledWith("pve", "UPID:pve:123:456:migrate", 600000);
@@ -131,14 +136,14 @@ describe("migration tools", () => {
         .mockRejectedValueOnce(new Error("nf"))                // resolveGuest: qemu fails
         .mockResolvedValueOnce({ status: "running" })          // resolveGuest: lxc check
         .mockResolvedValueOnce({ tags: "" })                   // getGuestTags: config (no tags)
-        .mockRejectedValueOnce(new Error(                     // move endpoint: not available
+        .mockRejectedValueOnce(new Error(                      // move endpoint: not available
           "No 'create' handler defined for '/nodes/pve/lxc/200/migrate'"
         ))
         .mockResolvedValueOnce({ hostname: "myct", tags: "" }) // config read for clone fallback
-        .mockResolvedValueOnce("UPID:pve:1:clone")            // clone task
-        .mockResolvedValueOnce("UPID:node2:2:start")          // start clone
-        .mockResolvedValueOnce("UPID:pve:3:stop")             // stop original
-        .mockResolvedValueOnce("UPID:pve:4:delete");          // delete original
+        .mockResolvedValueOnce({ status: "running" })          // original status: running
+        .mockResolvedValueOnce("UPID:pve:1:stop")              // stop original
+        .mockResolvedValueOnce("UPID:pve:2:clone")             // clone task
+        .mockResolvedValueOnce("UPID:node2:3:start");          // start clone
       mockGetNextVmid.mockResolvedValue(300);
       mockWaitForTask.mockResolvedValue(undefined);
 
@@ -148,24 +153,206 @@ describe("migration tools", () => {
         target_node: "node2",
       });
 
-      // Verify clone was called
+      // The original is stopped BEFORE the clone, so the copy is consistent and
+      // the two containers never run at once with the same hostname/IP/MAC.
+      const order = mockPvesh.mock.calls.map((c) => c[0] + " " + c[1]);
+      expect(order.indexOf("create /nodes/pve/lxc/200/status/stop")).toBeLessThan(
+        order.indexOf("create /nodes/pve/lxc/200/clone")
+      );
+
+      // Clone uses PVE's LXC spellings (newid/hostname) and is polled on the
+      // SOURCE node, which owns the task UPID.
       expect(mockPvesh).toHaveBeenCalledWith(
         "create",
         "/nodes/pve/lxc/200/clone",
-        { target: "node2", vmid: 300, name: "myct" },
+        { target: "node2", newid: 300, hostname: "myct", full: 1 },
         600000
       );
-      // Verify original was stopped and deleted
+      expect(mockWaitForTask).toHaveBeenCalledWith("pve", "UPID:pve:2:clone", 600000);
+
+      // The clone is started on the target
       expect(mockPvesh).toHaveBeenCalledWith(
-        "create", "/nodes/pve/lxc/200/status/stop", {}, 120000
+        "create", "/nodes/node2/lxc/300/status/start", {}, 120000
       );
-      expect(mockPvesh).toHaveBeenCalledWith(
-        "delete", "/nodes/pve/lxc/200", {}, 120000
-      );
-      // Result should report the new VMID
+
+      // The original is NOT deleted - this server does not destroy guests
+      const deletes = mockPvesh.mock.calls.filter((c) => c[0] === "delete");
+      expect(deletes).toHaveLength(0);
+
+      // Result reports the new VMID and the retained original
       expect(result.content[0].text).toContain("200");
       expect(result.content[0].text).toContain("300");
       expect(result.content[0].text).toContain("clone");
+      expect(result.content[0].text).toContain("left in place");
+    });
+
+    it("clone fallback should not stop an already-stopped original", async () => {
+      mockPvesh
+        .mockRejectedValueOnce(new Error("nf"))
+        .mockResolvedValueOnce({ status: "stopped" })          // resolveGuest: lxc
+        .mockResolvedValueOnce({ tags: "" })
+        .mockRejectedValueOnce(new Error(
+          "501 Method 'POST /nodes/pve/lxc/200/migrate' not implemented"
+        ))
+        .mockResolvedValueOnce({ hostname: "myct" })           // config
+        .mockResolvedValueOnce({ status: "stopped" })          // already stopped
+        .mockResolvedValueOnce("UPID:pve:1:clone")
+        .mockResolvedValueOnce("UPID:node2:2:start");
+      mockGetNextVmid.mockResolvedValue(301);
+      mockWaitForTask.mockResolvedValue(undefined);
+
+      await server.tools["migrate_guest"]({
+        node: "pve",
+        vmid: 200,
+        target_node: "node2",
+      });
+
+      const stops = mockPvesh.mock.calls.filter(
+        (c) => c[1] === "/nodes/pve/lxc/200/status/stop"
+      );
+      expect(stops).toHaveLength(0);
+    });
+
+    it("should rethrow a genuine LXC migrate failure instead of cloning", async () => {
+      mockPvesh
+        .mockRejectedValueOnce(new Error("nf"))
+        .mockResolvedValueOnce({ status: "running" })
+        .mockResolvedValueOnce({ tags: "" })
+        .mockRejectedValueOnce(new Error("storage 'ceph' is not available on node2"));
+
+      await expect(
+        server.tools["migrate_guest"]({
+          node: "pve",
+          vmid: 200,
+          target_node: "node2",
+        })
+      ).rejects.toThrow("storage 'ceph' is not available");
+
+      const clones = mockPvesh.mock.calls.filter((c) => String(c[1]).endsWith("/clone"));
+      expect(clones).toHaveLength(0);
+    });
+
+    it("should reject a non-positive bandwidth", async () => {
+      await expect(
+        server.tools["migrate_guest"]({
+          node: "pve",
+          vmid: 100,
+          target_node: "node2",
+          bandwidth: 0,
+        })
+      ).rejects.toThrow();
+    });
+
+    it("should send online=0 when online is explicitly false for QEMU", async () => {
+      mockPvesh
+        .mockResolvedValueOnce({ status: "running" })
+        .mockResolvedValueOnce({ tags: "" })
+        .mockResolvedValueOnce(null);
+      mockWaitForTask.mockResolvedValue(undefined);
+
+      await server.tools["migrate_guest"]({
+        node: "pve",
+        vmid: 100,
+        target_node: "node2",
+        online: false,
+      });
+
+      expect(mockPvesh).toHaveBeenCalledWith(
+        "create",
+        "/nodes/pve/qemu/100/migrate",
+        { target: "node2", bwlimit: 153600, online: 0 },
+        600000
+      );
+    });
+
+    it("should send online=1 for LXC only when explicitly requested", async () => {
+      mockPvesh
+        .mockRejectedValueOnce(new Error("nf"))
+        .mockResolvedValueOnce({ status: "running" })
+        .mockResolvedValueOnce({ tags: "" })
+        .mockResolvedValueOnce(null);
+      mockWaitForTask.mockResolvedValue(undefined);
+
+      await server.tools["migrate_guest"]({
+        node: "pve",
+        vmid: 200,
+        target_node: "node2",
+        online: true,
+      });
+
+      expect(mockPvesh).toHaveBeenCalledWith(
+        "create",
+        "/nodes/pve/lxc/200/migrate",
+        { target: "node2", bwlimit: 153600, online: 1 },
+        600000
+      );
+    });
+
+    it("should use PVE's hyphenated target-storage on the LXC endpoint", async () => {
+      mockPvesh
+        .mockRejectedValueOnce(new Error("nf"))
+        .mockResolvedValueOnce({ status: "running" })
+        .mockResolvedValueOnce({ tags: "" })
+        .mockResolvedValueOnce(null);
+      mockWaitForTask.mockResolvedValue(undefined);
+
+      await server.tools["migrate_guest"]({
+        node: "pve",
+        vmid: 200,
+        target_node: "node2",
+        target_storage: "ceph-pool",
+      });
+
+      expect(mockPvesh).toHaveBeenCalledWith(
+        "create",
+        "/nodes/pve/lxc/200/migrate",
+        { target: "node2", bwlimit: 153600, restart: 1, "target-storage": "ceph-pool" },
+        600000
+      );
+    });
+
+    it("should rethrow a non-object throw from the LXC migrate endpoint", async () => {
+      mockPvesh
+        .mockRejectedValueOnce(new Error("nf"))
+        .mockResolvedValueOnce({ status: "running" })
+        .mockResolvedValueOnce({ tags: "" })
+        .mockRejectedValueOnce(null); // a bare null throw is not "endpoint missing"
+
+      await expect(
+        server.tools["migrate_guest"]({
+          node: "pve",
+          vmid: 200,
+          target_node: "node2",
+        })
+      ).rejects.toBeNull();
+    });
+
+    it("clone fallback should pass target storage as `storage`", async () => {
+      mockPvesh
+        .mockRejectedValueOnce(new Error("nf"))
+        .mockResolvedValueOnce({ status: "running" })
+        .mockResolvedValueOnce({ tags: "" })
+        .mockRejectedValueOnce(new Error("unknown command"))
+        .mockResolvedValueOnce({ hostname: "myct" })
+        .mockResolvedValueOnce({ status: "stopped" })
+        .mockResolvedValueOnce("UPID:pve:1:clone")
+        .mockResolvedValueOnce("UPID:node2:2:start");
+      mockGetNextVmid.mockResolvedValue(403);
+      mockWaitForTask.mockResolvedValue(undefined);
+
+      await server.tools["migrate_guest"]({
+        node: "pve",
+        vmid: 200,
+        target_node: "node2",
+        target_storage: "ceph-pool",
+      });
+
+      expect(mockPvesh).toHaveBeenCalledWith(
+        "create",
+        "/nodes/pve/lxc/200/clone",
+        { target: "node2", newid: 403, hostname: "myct", full: 1, storage: "ceph-pool" },
+        600000
+      );
     });
 
     it("should refuse if guest is already on target node", async () => {
@@ -226,7 +413,7 @@ describe("migration tools", () => {
       expect(mockPvesh).toHaveBeenCalledWith(
         "create",
         "/nodes/pve/qemu/100/migrate",
-        { target: "node2", bwlimit: 200, online: 1 },
+        { target: "node2", bwlimit: 204800, online: 1 },
         600000
       );
     });
@@ -248,7 +435,7 @@ describe("migration tools", () => {
       expect(mockPvesh).toHaveBeenCalledWith(
         "create",
         "/nodes/pve/qemu/100/migrate",
-        { target: "node2", bwlimit: 150, online: 1, target_storage: "ceph-pool" },
+        { target: "node2", bwlimit: 153600, online: 1, targetstorage: "ceph-pool" },
         600000
       );
     });
@@ -407,6 +594,153 @@ describe("migration tools", () => {
       expect(text).toContain("network timeout");
     });
 
+    it("should report a clone-fallback migration and the retained original", async () => {
+      mockPvesh
+        .mockResolvedValueOnce([])                             // no qemu
+        .mockResolvedValueOnce([{ vmid: 200, name: "ct-a" }])  // one lxc
+        .mockResolvedValueOnce({ tags: "" })                   // tag check
+        .mockRejectedValueOnce(new Error(                      // migrate unavailable
+          "no such resource '/nodes/pve/lxc/200/migrate'"
+        ))
+        .mockResolvedValueOnce({})                             // config without hostname
+        .mockResolvedValueOnce(null)                           // status unreadable
+        .mockResolvedValueOnce("UPID:pve:1:clone")
+        .mockResolvedValueOnce("UPID:node2:2:start");
+      mockGetNextVmid.mockResolvedValue(400);
+      mockWaitForTask.mockResolvedValue(undefined);
+
+      const result = await server.tools["drain_node"]({
+        source_node: "pve",
+        target_node: "node2",
+      });
+
+      const text = result.content[0].text;
+      expect(text).toContain("Migrated: 1");
+      expect(text).toContain("200 → 400");
+      expect(text).toContain("[clone]");
+      expect(text).toContain("Stopped originals left in place");
+      // A config with no hostname falls back to a derived name
+      expect(mockPvesh).toHaveBeenCalledWith(
+        "create",
+        "/nodes/pve/lxc/200/clone",
+        { target: "node2", newid: 400, hostname: "ct-200", full: 1 },
+        600000
+      );
+      // Status was unreadable, so no stop was attempted
+      const stops = mockPvesh.mock.calls.filter(
+        (c) => c[1] === "/nodes/pve/lxc/200/status/stop"
+      );
+      expect(stops).toHaveLength(0);
+    });
+
+    it("should fall back to clone when only stderr reveals the missing endpoint", async () => {
+      const err: any = new Error("pvesh command failed");
+      err.stderr = "501 Method 'POST /nodes/pve/lxc/200/migrate' not implemented";
+      mockPvesh
+        .mockRejectedValueOnce(new Error("nf"))
+        .mockResolvedValueOnce({ status: "running" })
+        .mockResolvedValueOnce({ tags: "" })
+        .mockRejectedValueOnce(err)
+        .mockResolvedValueOnce({ hostname: "myct" })
+        .mockResolvedValueOnce({ status: "stopped" })
+        .mockResolvedValueOnce("UPID:pve:1:clone")
+        .mockResolvedValueOnce("UPID:node2:2:start");
+      mockGetNextVmid.mockResolvedValue(402);
+      mockWaitForTask.mockResolvedValue(undefined);
+
+      const result = await server.tools["migrate_guest"]({
+        node: "pve",
+        vmid: 200,
+        target_node: "node2",
+      });
+
+      expect(result.content[0].text).toContain("402");
+    });
+
+    it("should render non-Error throw shapes in the failure report", async () => {
+      mockPvesh
+        .mockResolvedValueOnce([
+          { vmid: 100, name: "a" },
+          { vmid: 101, name: "b" },
+          { vmid: 102, name: "c" },
+          { vmid: 103, name: "d" },
+        ])
+        .mockResolvedValueOnce([])
+        .mockRejectedValueOnce("plain string failure")       // string throw
+        .mockRejectedValueOnce({ message: "object message" }) // object with message
+        .mockRejectedValueOnce({ stderr: "object stderr" })   // object with stderr only
+        .mockRejectedValueOnce({ code: 7 });                  // neither -> JSON
+
+      const result = await server.tools["drain_node"]({
+        source_node: "pve",
+        target_node: "node2",
+      });
+
+      const text = result.content[0].text;
+      expect(text).toContain("Failed: 4");
+      expect(text).toContain("plain string failure");
+      expect(text).toContain("object message");
+      expect(text).toContain("object stderr");
+      expect(text).toContain('{"code":7}');
+    });
+
+    it("should treat a config with no tags field as untagged", async () => {
+      mockPvesh
+        .mockResolvedValueOnce([{ vmid: 100, name: "web" }])
+        .mockResolvedValueOnce([])
+        .mockResolvedValueOnce({ cores: 2 }) // config has no `tags` key at all
+        .mockResolvedValueOnce(null);
+      mockWaitForTask.mockResolvedValue(undefined);
+
+      const result = await server.tools["drain_node"]({
+        source_node: "pve",
+        target_node: "node2",
+      });
+
+      expect(result.content[0].text).toContain("Migrated: 1");
+    });
+
+    it("should ignore non-array guest listings", async () => {
+      mockPvesh
+        .mockResolvedValueOnce(null) // qemu listing is not an array
+        .mockResolvedValueOnce("x"); // lxc listing is not an array
+
+      const result = await server.tools["drain_node"]({
+        source_node: "pve",
+        target_node: "node2",
+      });
+
+      expect(result.content[0].text).toContain("has no guests to drain");
+    });
+
+    it("should skip listing entries with an unusable vmid and derive missing names", async () => {
+      mockPvesh
+        .mockResolvedValueOnce([
+          { vmid: "bad" }, // not a number
+          { vmid: 0 },     // not > 0
+          { vmid: 100 },   // valid, but unnamed
+        ])
+        .mockResolvedValueOnce([
+          { vmid: null },  // not a number
+          { vmid: -1 },    // not > 0
+          { vmid: 200 },   // valid, but unnamed
+        ])
+        .mockResolvedValueOnce({ tags: "" })
+        .mockResolvedValueOnce({ tags: "" });
+
+      const result = await server.tools["drain_node"]({
+        source_node: "pve",
+        target_node: "node2",
+        dry_run: true,
+      });
+
+      const text = result.content[0].text;
+      expect(text).toContain("Would migrate (2)");
+      expect(text).toContain("vm-100");
+      expect(text).toContain("ct-200");
+      expect(text).not.toContain("bad");
+    });
+
     it("dry_run should report plan without migrating", async () => {
       mockPvesh
         .mockResolvedValueOnce([
@@ -437,6 +771,31 @@ describe("migration tools", () => {
       // Verify no migrate API was called
       const createCalls = mockPvesh.mock.calls.filter((c) => c[0] === "create");
       expect(createCalls).toHaveLength(0);
+    });
+
+    it("dry_run should report guests whose tag check failed", async () => {
+      mockPvesh
+        .mockResolvedValueOnce([
+          { vmid: 100, name: "web", status: "running" },
+          { vmid: 101, name: "mystery", status: "running" },
+        ])
+        .mockResolvedValueOnce([]) // no LXC
+        .mockResolvedValueOnce({ tags: "" }) // config 100 -> migratable
+        .mockResolvedValueOnce(null);        // config 101 -> fail-closed
+
+      const result = await server.tools["drain_node"]({
+        source_node: "pve",
+        target_node: "node2",
+        dry_run: true,
+      });
+
+      const text = result.content[0].text;
+      expect(text).toContain("Would migrate (1)");
+      // A guest that could not be checked must not silently vanish from the
+      // preview, or the operator concludes the node would be fully evacuated.
+      expect(text).toContain("Cannot determine");
+      expect(text).toContain("mystery");
+      expect(text).toContain("would not be fully evacuated");
     });
 
     it("dry_run with no guests should report empty", async () => {

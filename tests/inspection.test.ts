@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
+import { z } from "zod";
 
 // Mock the proxmox module
 vi.mock("../src/proxmox.js", () => {
@@ -56,8 +57,12 @@ function createMockServer() {
   const tools: Record<string, any> = {};
   return {
     tools,
-    registerTool(name: string, _meta: any, handler: any) {
-      tools[name] = handler;
+    registerTool(name: string, meta: any, handler: any) {
+      // Apply the tool's own inputSchema the way the MCP SDK does, so every
+      // `.default()` is exercised and tests see the values production sees.
+      const schema = meta?.inputSchema ? z.object(meta.inputSchema) : null;
+      tools[name] = async (args: any = {}) =>
+        handler(schema ? schema.parse(args) : args);
     },
   } as any;
 }

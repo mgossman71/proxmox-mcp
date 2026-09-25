@@ -166,21 +166,27 @@ export function registerProvisioningTools(server: McpServer): void {
         await assertMovable(info.node, info.type, vmid, info.name);
       }
 
+      // The clone endpoint lives on the node the source guest is actually on,
+      // which is not necessarily the `node` argument, and it owns the resulting
+      // task — so the UPID has to be polled there too, not on the target.
+      const sourceNode = info.node;
+
       const params: Record<string, string | number | boolean> = {
         target,
-        name: new_name,
-        vmid: newId,
+        newid: newId,
       };
 
       if (info.type === "qemu") {
+        params.name = new_name;
         if (!full) params.snapshot = "current";
-        const result = await pvesh("create", `/nodes/${node}/qemu/${vmid}/clone`, params, 300000);
-        await waitForTask(target, asString(result));
+        const result = await pvesh("create", `/nodes/${sourceNode}/qemu/${vmid}/clone`, params, 300000);
+        await waitForTask(sourceNode, asString(result));
       } else {
-        // LXC clone
+        // LXC clone names the guest with `hostname`; `name` is the QEMU spelling
+        params.hostname = new_name;
         if (!full) params.snapshot = "current";
-        const result = await pvesh("create", `/nodes/${node}/lxc/${vmid}/clone`, params, 300000);
-        await waitForTask(target, asString(result));
+        const result = await pvesh("create", `/nodes/${sourceNode}/lxc/${vmid}/clone`, params, 300000);
+        await waitForTask(sourceNode, asString(result));
       }
 
       return {

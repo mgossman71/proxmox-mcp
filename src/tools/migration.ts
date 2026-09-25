@@ -6,6 +6,30 @@ import { nodeParam, vmidParam, targetNodeParam } from "../schemas.js";
 const DONT_MOVE_TAG = "dont-move";
 
 /**
+ * PVE's `bwlimit` is expressed in KiB/s on every migrate/clone endpoint, while
+ * the tools take a friendlier MB/s value. Convert at the boundary.
+ */
+const KIB_PER_MB = 1024;
+
+/**
+ * Message fragments that indicate the endpoint we called does not exist on this
+ * PVE version, as opposed to the operation itself failing. Matched
+ * case-insensitively against both the error message and any captured stderr.
+ *
+ * Older PVE reports a missing handler; newer versions answer with a 501 or a
+ * "no such resource" error instead, so all three shapes have to be covered or
+ * the LXC clone fallback never runs on the clusters it exists for.
+ */
+const ENDPOINT_MISSING_PATTERNS = [
+  "no 'create' handler",
+  "handler defined",
+  "not implemented",
+  "no such resource",
+  "unknown command",
+  "501",
+];
+
+/**
  * Extract a human-readable error message from any thrown value.
  */
 function errMsg(err: unknown): string {
@@ -17,6 +41,20 @@ function errMsg(err: unknown): string {
     if (typeof o.stderr === "string") return o.stderr;
   }
   return JSON.stringify(err);
+}
+
+/**
+ * True when the error looks like "this endpoint does not exist here" rather
+ * than "the operation failed".
+ */
+function isEndpointMissing(err: unknown): boolean {
+  const parts = [errMsg(err)];
+  if (typeof err === "object" && err !== null) {
+    const stderr = (err as any).stderr;
+    if (typeof stderr === "string") parts.push(stderr);
+  }
+  const haystack = parts.join("\n").toLowerCase();
+  return ENDPOINT_MISSING_PATTERNS.some((p) => haystack.includes(p));
 }
 
 /**
@@ -59,6 +97,13 @@ export async function assertMovable(
   }
 }
 
+interface MigrationResult {
+  newVmid: number;
+  method: "migrate" | "move" | "clone-fallback";
+  /** True when a stopped copy of the source guest was deliberately left behind. */
+  originalRetained?: boolean;
+}
+
 /**
  * Perform a single guest migration to the target node.
  * Returns the final VMID (may differ from input for LXC clone fallback).
@@ -68,17 +113,20 @@ async function performMigration(
   type: "qemu" | "lxc",
   vmid: number,
   target: string,
-  bandwidth: number | undefined,
+  bandwidth: number,
   targetStorage?: string,
   online?: boolean
-): Promise<{ newVmid: number; method: "migrate" | "move" | "clone-fallback" }> {
+): Promise<MigrationResult> {
+  const bwlimit = bandwidth * KIB_PER_MB;
+
   if (type === "qemu") {
     const params: Record<string, string | number | boolean> = {
       target,
-      bwlimit: bandwidth ?? 150,
+      bwlimit,
+      // QEMU migration defaults to live/online; only an explicit false opts out.
       online: online === false ? 0 : 1,
     };
-    if (targetStorage) params.target_storage = targetStorage;
+    if (targetStorage) params.targetstorage = targetStorage;
     const result = await pvesh(
       "create",
       `/nodes/${node}/qemu/${vmid}/migrate`,
@@ -93,14 +141,14 @@ async function performMigration(
   try {
     const params: Record<string, string | number | boolean> = {
       target,
-      bwlimit: (bandwidth ?? 150) * 1024,
+      bwlimit,
     };
     if (online) {
       params.online = 1;
     } else {
       params.restart = 1;
     }
-    if (targetStorage) params.target_storage = targetStorage;
+    if (targetStorage) params["target-storage"] = targetStorage;
     const result = await pvesh(
       "create",
       `/nodes/${node}/lxc/${vmid}/migrate`,
@@ -111,32 +159,52 @@ async function performMigration(
     return { newVmid: vmid, method: "move" };
   } catch (err: any) {
     // If the endpoint doesn't exist at all, fall back to clone-based approach
-    const msg = err.message || String(err);
-    if (!msg.includes("No 'create' handler") && !msg.includes("handler defined")) {
+    if (!isEndpointMissing(err)) {
       throw err;
     }
 
-    // Clone-based fallback: clone → start clone → stop original → delete original
+    // Clone-based fallback: stop original → clone → start clone.
+    //
+    // The original is stopped *before* the clone so the copy is consistent and
+    // the two containers never run concurrently with the same hostname/IP/MAC.
+    // It is then left in place, stopped, for the operator to remove — this tool
+    // does not delete guests.
     const config = asObject(
       await pvesh("get", `/nodes/${node}/lxc/${vmid}/config`)
     );
-    const name = config?.hostname || `ct-${vmid}`;
+    const hostname = config?.hostname || `ct-${vmid}`;
     const newVmid = await getNextVmid();
 
-    // Clone to target
+    // Stop the original first, so the clone is consistent
+    const status = asObject(
+      await pvesh("get", `/nodes/${node}/lxc/${vmid}/status/current`)
+    );
+    if (status?.status === "running") {
+      const stopResult = await pvesh(
+        "create",
+        `/nodes/${node}/lxc/${vmid}/status/stop`,
+        {},
+        120000
+      );
+      await waitForTask(node, asString(stopResult), 120000);
+    }
+
+    // Clone to target. The clone task is owned by the *source* node, so it must
+    // be polled there — the target node cannot report on another node's UPID.
     const cloneParams: Record<string, string | number | boolean> = {
       target,
-      vmid: newVmid,
-      name,
+      newid: newVmid,
+      hostname,
+      full: 1,
     };
-    if (targetStorage) cloneParams.target_storage = targetStorage;
+    if (targetStorage) cloneParams.storage = targetStorage;
     const cloneResult = await pvesh(
       "create",
       `/nodes/${node}/lxc/${vmid}/clone`,
       cloneParams,
       600000
     );
-    await waitForTask(target, asString(cloneResult), 600000);
+    await waitForTask(node, asString(cloneResult), 600000);
 
     // Start the clone on target
     const startResult = await pvesh(
@@ -147,27 +215,30 @@ async function performMigration(
     );
     await waitForTask(target, asString(startResult), 120000);
 
-    // Stop the original
-    const stopResult = await pvesh(
-      "create",
-      `/nodes/${node}/lxc/${vmid}/status/stop`,
-      {},
-      120000
-    );
-    await waitForTask(node, asString(stopResult), 120000);
-
-    // Delete the original
-    const delResult = await pvesh(
-      "delete",
-      `/nodes/${node}/lxc/${vmid}`,
-      {},
-      120000
-    );
-    await waitForTask(node, asString(delResult), 120000);
-
-    return { newVmid, method: "clone-fallback" };
+    return { newVmid, method: "clone-fallback", originalRetained: true };
   }
 }
+
+/** Bandwidth limit shared by both migration tools. */
+const bandwidthParam = z
+  .number()
+  .int()
+  .positive()
+  .default(150)
+  .describe("Bandwidth limit in MB/s (default 150). Must be a positive integer.");
+
+/**
+ * Deliberately has no zod default: `undefined` is the signal that the caller
+ * did not choose, which lets each guest type apply its own sensible default
+ * (QEMU live, LXC restart) inside performMigration.
+ */
+const onlineParam = z
+  .boolean()
+  .optional()
+  .describe(
+    "Use live/online migration. Defaults to online for QEMU (no downtime) and " +
+      "to restart for LXC (brief downtime; LXC live migration is experimental)."
+  );
 
 export function registerMigrationTools(server: McpServer): void {
   // migrate_guest
@@ -183,18 +254,12 @@ export function registerMigrationTools(server: McpServer): void {
         node: nodeParam,
         vmid: vmidParam,
         target_node: targetNodeParam,
-        bandwidth: z
-          .number()
-          .default(150)
-          .describe("Bandwidth limit in MB/s (QEMU only; default 150)"),
+        bandwidth: bandwidthParam,
         target_storage: z
           .string()
           .optional()
           .describe("Target storage pool (if different from source)"),
-        online: z
-          .boolean()
-          .default(false)
-          .describe("Use live/online migration (QEMU: no downtime; LXC: experimental). LXC defaults to restart."),
+        online: onlineParam,
       },
     },
     async ({ node, vmid, target_node, bandwidth, target_storage, online }) => {
@@ -218,13 +283,22 @@ export function registerMigrationTools(server: McpServer): void {
         online
       );
 
+      let text =
+        result.newVmid !== vmid
+          ? `OK: Migrated ${type} VMID ${vmid} → ${result.newVmid} (clone) from '${guestNode}' to '${target_node}'.`
+          : `OK: Migrated ${type} VMID ${vmid} from '${guestNode}' to '${target_node}'.`;
+
+      if (result.originalRetained) {
+        text +=
+          `\nNOTE: the source container ${vmid} was stopped and left in place on ` +
+          `'${guestNode}'. Verify the copy, then remove the original yourself.`;
+      }
+
       return {
         content: [
           {
             type: "text" as const,
-            text: result.newVmid !== vmid
-              ? `OK: Migrated ${type} VMID ${vmid} → ${result.newVmid} (clone) from '${guestNode}' to '${target_node}'.`
-              : `OK: Migrated ${type} VMID ${vmid} from '${guestNode}' to '${target_node}'.`,
+            text,
           },
         ],
       };
@@ -244,10 +318,7 @@ export function registerMigrationTools(server: McpServer): void {
       inputSchema: {
         source_node: nodeParam,
         target_node: targetNodeParam,
-        bandwidth: z
-          .number()
-          .default(150)
-          .describe("Per-migration bandwidth limit in MB/s (default 150)"),
+        bandwidth: bandwidthParam,
         target_storage: z
           .string()
           .optional()
@@ -256,10 +327,7 @@ export function registerMigrationTools(server: McpServer): void {
           .boolean()
           .default(false)
           .describe("Preview only: show what would be migrated/skipped without performing migrations"),
-        online: z
-          .boolean()
-          .default(false)
-          .describe("Use live/online migration (QEMU: no downtime; LXC: experimental). LXC defaults to restart."),
+        online: onlineParam,
       },
     },
     async ({ source_node, target_node, bandwidth, target_storage, dry_run, online }) => {
@@ -336,6 +404,19 @@ export function registerMigrationTools(server: McpServer): void {
             lines.push(`  ${s.vmid} (${s.type}) "${s.name}"`);
           }
         }
+        // Guests whose tag check failed cannot be planned either way. Reporting
+        // them here keeps the preview an honest account of the whole node.
+        if (failed.length > 0) {
+          lines.push("");
+          lines.push(`Cannot determine — tag check failed (${failed.length}):`);
+          for (const f of failed) {
+            lines.push(`  ${f.vmid} "${f.name}": ${f.error}`);
+          }
+          lines.push("");
+          lines.push(
+            `These guests would NOT be migrated; '${source_node}' would not be fully evacuated.`
+          );
+        }
         return {
           content: [
             {
@@ -348,6 +429,7 @@ export function registerMigrationTools(server: McpServer): void {
 
       // Perform migrations sequentially
       const migrated: string[] = [];
+      const retained: number[] = [];
 
       for (const g of toMigrate) {
         try {
@@ -365,6 +447,7 @@ export function registerMigrationTools(server: McpServer): void {
           } else {
             migrated.push(`${g.vmid} (${g.type}) "${g.name}"`);
           }
+          if (result.originalRetained) retained.push(g.vmid);
         } catch (err: any) {
           failed.push({
             vmid: g.vmid,
@@ -404,6 +487,14 @@ export function registerMigrationTools(server: McpServer): void {
         for (const f of failed) {
           summary.push(`    ✗ ${f.vmid} "${f.name}": ${f.error}`);
         }
+      }
+
+      if (retained.length > 0) {
+        summary.push("");
+        summary.push(
+          `  Stopped originals left in place on '${source_node}' (clone fallback): ${retained.join(", ")}`
+        );
+        summary.push("  Verify the copies, then remove the originals yourself.");
       }
 
       return {

@@ -126,6 +126,19 @@ curl http://localhost:3000/health
 | `migrate_guest` | Live-migrate a QEMU VM or move an LXC container to another node |
 | `drain_node` | Migrate all guests off a node (for maintenance/decommission) |
 
+`bandwidth` is given in **MB/s** on both tools and is converted to PVE's KiB/s
+`bwlimit` internally. QEMU migrations are live by default; LXC migrations
+restart the container by default, since LXC live migration is experimental —
+pass `online: true` to opt in, or `online: false` to force a QEMU migration
+offline.
+
+On PVE versions without the native LXC migrate endpoint, `migrate_guest` falls
+back to a clone: the source container is **stopped first**, cloned to the target
+under a new VMID, and the clone is started there. The stopped original is
+deliberately **left in place** — this server never deletes a guest — so verify
+the copy and remove the original yourself. Both the new VMID and the retained
+original are named in the tool's output.
+
 ## Development
 
 ```bash
