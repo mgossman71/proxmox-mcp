@@ -102,6 +102,38 @@ interface MigrationResult {
   method: "migrate" | "move" | "clone-fallback";
   /** True when a stopped copy of the source guest was deliberately left behind. */
   originalRetained?: boolean;
+  /** True when the guest had to be shut down and restarted to move it. */
+  restarted?: boolean;
+}
+
+/** Shut a guest down cleanly and wait for it to stop. */
+async function shutdownGuest(
+  node: string,
+  type: "qemu" | "lxc",
+  vmid: number
+): Promise<void> {
+  const result = await pvesh(
+    "create",
+    `/nodes/${node}/${type}/${vmid}/status/shutdown`,
+    {},
+    300000
+  );
+  await waitForTask(node, asString(result), 300000);
+}
+
+/** Start a guest and wait for it to come up. */
+async function startGuest(
+  node: string,
+  type: "qemu" | "lxc",
+  vmid: number
+): Promise<void> {
+  const result = await pvesh(
+    "create",
+    `/nodes/${node}/${type}/${vmid}/status/start`,
+    {},
+    120000
+  );
+  await waitForTask(node, asString(result), 120000);
 }
 
 /**
@@ -121,49 +153,103 @@ async function performMigration(
   const bwlimit = bandwidth * KIB_PER_MB;
 
   if (type === "qemu") {
-    // A stopped VM can only migrate offline -- asking PVE to live-migrate one
-    // is an error. `online` is therefore a preference that applies to running
-    // guests only: live by default, and an explicit false opts out.
-    const params: Record<string, string | number | boolean> = {
-      target,
-      bwlimit,
-      online: running && online !== false ? 1 : 0,
+    const base: Record<string, string | number | boolean> = { target, bwlimit };
+    if (targetStorage) base.targetstorage = targetStorage;
+
+    const migrate = async (params: Record<string, string | number | boolean>) => {
+      const result = await pvesh(
+        "create",
+        `/nodes/${node}/qemu/${vmid}/migrate`,
+        params,
+        600000
+      );
+      await waitForTask(node, asString(result), 600000);
     };
-    if (targetStorage) params.targetstorage = targetStorage;
-    const result = await pvesh(
-      "create",
-      `/nodes/${node}/qemu/${vmid}/migrate`,
-      params,
-      600000
-    );
-    await waitForTask(node, asString(result), 600000);
-    return { newVmid: vmid, method: "migrate" };
+
+    // Stopped stays stopped: move it offline and leave it that way.
+    if (!running) {
+      await migrate({ ...base, online: 0 });
+      return { newVmid: vmid, method: "migrate" };
+    }
+
+    // Running: live migrate if we can, since that keeps the guest up.
+    if (online !== false) {
+      try {
+        await migrate({ ...base, online: 1 });
+        return { newVmid: vmid, method: "migrate" };
+      } catch {
+        // Live migration is not possible for this guest (local devices, CPU
+        // mismatch, unshared storage...). Fall through and move it the slow
+        // way rather than leaving it where it is.
+      }
+    }
+
+    // Live migration is out, but the guest was running and must end up running:
+    // shut it down, move it offline, start it on the target.
+    await shutdownGuest(node, "qemu", vmid);
+    try {
+      await migrate({ ...base, online: 0 });
+    } catch (err: any) {
+      // The move failed, so the guest is still on the source node -- put it
+      // back the way we found it rather than leaving it down.
+      try {
+        await startGuest(node, "qemu", vmid);
+      } catch {
+        throw new ProxmoxError(
+          `Migration of VMID ${vmid} failed after shutdown (${errMsg(err)}), ` +
+            `and it could not be restarted on '${node}'. It is stopped there.`
+        );
+      }
+      throw new ProxmoxError(
+        `Migration of VMID ${vmid} failed (${errMsg(err)}). It has been ` +
+          `restarted on '${node}' and is running as before.`
+      );
+    }
+    await startGuest(target, "qemu", vmid);
+    return { newVmid: vmid, method: "migrate", restarted: true };
   }
 
   // LXC: try native move endpoint first (PVE 7.3+)
   try {
-    const params: Record<string, string | number | boolean> = {
-      target,
-      bwlimit,
+    const base: Record<string, string | number | boolean> = { target, bwlimit };
+    if (targetStorage) base["target-storage"] = targetStorage;
+
+    const migrate = async (params: Record<string, string | number | boolean>) => {
+      const result = await pvesh(
+        "create",
+        `/nodes/${node}/lxc/${vmid}/migrate`,
+        params,
+        600000
+      );
+      await waitForTask(node, asString(result), 600000);
     };
+
     // Both flags describe what to do with a *running* container. A stopped one
-    // migrates plainly, and sending either would have PVE reject the request.
-    if (running) {
-      if (online) {
-        params.online = 1;
-      } else {
-        params.restart = 1;
+    // migrates plainly and stays stopped; sending either would have PVE reject
+    // the request.
+    if (!running) {
+      await migrate(base);
+      return { newVmid: vmid, method: "move" };
+    }
+
+    // Live migration only when explicitly asked for: it is experimental for
+    // LXC, so it is not what a caller gets by default.
+    if (online) {
+      try {
+        await migrate({ ...base, online: 1 });
+        return { newVmid: vmid, method: "move" };
+      } catch (err: any) {
+        // A missing endpoint is not a live-migration failure -- let the clone
+        // fallback below handle it.
+        if (isEndpointMissing(err)) throw err;
+        // Otherwise live migration is not possible here; restart instead.
       }
     }
-    if (targetStorage) params["target-storage"] = targetStorage;
-    const result = await pvesh(
-      "create",
-      `/nodes/${node}/lxc/${vmid}/migrate`,
-      params,
-      600000
-    );
-    await waitForTask(node, asString(result), 600000);
-    return { newVmid: vmid, method: "move" };
+
+    // restart=1 is PVE's own shutdown → move → start, so the container ends up
+    // running on the target as it was on the source.
+    await migrate({ ...base, restart: 1 });
+    return { newVmid: vmid, method: "move", restarted: true };
   } catch (err: any) {
     // If the endpoint doesn't exist at all, fall back to clone-based approach
     if (!isEndpointMissing(err)) {
@@ -182,11 +268,14 @@ async function performMigration(
     const hostname = config?.hostname || `ct-${vmid}`;
     const newVmid = await getNextVmid();
 
-    // Stop the original first, so the clone is consistent
+    // Stop the original first, so the clone is consistent. This read is also
+    // what decides whether the clone gets started, so the container ends up in
+    // the same run state it started in.
     const status = asObject(
       await pvesh("get", `/nodes/${node}/lxc/${vmid}/status/current`)
     );
-    if (status?.status === "running") {
+    const wasRunning = status?.status === "running";
+    if (wasRunning) {
       const stopResult = await pvesh(
         "create",
         `/nodes/${node}/lxc/${vmid}/status/stop`,
@@ -213,16 +302,18 @@ async function performMigration(
     );
     await waitForTask(node, asString(cloneResult), 600000);
 
-    // Start the clone on target
-    const startResult = await pvesh(
-      "create",
-      `/nodes/${target}/lxc/${newVmid}/status/start`,
-      {},
-      120000
-    );
-    await waitForTask(target, asString(startResult), 120000);
+    // Start the clone only if the original was running -- a stopped container
+    // must not come back up on the target.
+    if (wasRunning) {
+      await startGuest(target, "lxc", newVmid);
+    }
 
-    return { newVmid, method: "clone-fallback", originalRetained: true };
+    return {
+      newVmid,
+      method: "clone-fallback",
+      originalRetained: true,
+      restarted: wasRunning,
+    };
   }
 }
 
@@ -243,9 +334,12 @@ const onlineParam = z
   .boolean()
   .optional()
   .describe(
-    "How to move a *running* guest: live by default for QEMU (no downtime), " +
-      "restart-on-target for LXC (brief downtime; LXC live migration is " +
-      "experimental). Ignored for stopped guests, which always migrate offline."
+    "Whether to attempt live migration of a *running* guest: on by default for " +
+      "QEMU (no downtime), off by default for LXC (live migration is " +
+      "experimental there). When live migration is not used or not possible, " +
+      "the guest is shut down, moved and started again, so it still ends up " +
+      "running. Ignored for stopped guests, which always migrate offline and " +
+      "stay stopped."
   );
 
 export function registerMigrationTools(server: McpServer): void {
@@ -257,9 +351,10 @@ export function registerMigrationTools(server: McpServer): void {
       description:
         "Migrate a QEMU VM or LXC container to another cluster node. " +
         "Refuses to migrate guests tagged with 'dont-move'. " +
-        "Works whether the guest is running or stopped: a running guest is " +
-        "migrated live (QEMU) or restarted on the target (LXC), and a stopped " +
-        "guest is migrated offline. There is no need to start a guest first.",
+        "The guest's run state is preserved: a stopped guest is moved offline " +
+        "and left stopped, and a running guest ends up running on the target — " +
+        "live-migrated if possible, otherwise shut down, moved and started " +
+        "again. There is no need to start or stop a guest first.",
       inputSchema: {
         node: nodeParam,
         vmid: vmidParam,
@@ -299,6 +394,12 @@ export function registerMigrationTools(server: McpServer): void {
           ? `OK: Migrated ${type} VMID ${vmid} → ${result.newVmid} (clone) from '${guestNode}' to '${target_node}'.`
           : `OK: Migrated ${type} VMID ${vmid} from '${guestNode}' to '${target_node}'.`;
 
+      if (result.restarted) {
+        text +=
+          `\nNOTE: live migration was not possible, so ${vmid} was shut down, ` +
+          `moved, and started again on '${target_node}'. It is running.`;
+      }
+
       if (result.originalRetained) {
         text +=
           `\nNOTE: the source container ${vmid} was stopped and left in place on ` +
@@ -323,6 +424,7 @@ export function registerMigrationTools(server: McpServer): void {
       title: "Drain Cluster Node",
       description:
         "Migrate all guests from one cluster node to another (for maintenance or decommissioning). " +
+        "Each guest's run state is preserved: stopped guests stay stopped, running guests end up running. " +
         "Automatically skips guests tagged 'dont-move'. " +
         "Migrations are performed sequentially to avoid saturating the network. " +
         "Use dry_run=true to preview what would be migrated without performing any migrations.",

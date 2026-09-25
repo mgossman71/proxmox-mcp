@@ -129,18 +129,30 @@ curl http://localhost:3000/health
 `bandwidth` is given in **MB/s** on both tools and is converted to PVE's KiB/s
 `bwlimit` internally.
 
-A guest does **not** need to be running to be migrated, and neither tool will
-start one for you. Stopped guests migrate offline; the `online` option applies
-only to guests that are already running. For those, QEMU migrations are live by
-default and LXC migrations restart the container by default, since LXC live
-migration is experimental — pass `online: true` to opt in, or `online: false` to
-force a QEMU migration offline.
+**Run state is preserved.** A guest ends a migration in the state it started in,
+and a guest never needs to be started or stopped first:
+
+| Guest was | What happens | Guest ends up |
+|-----------|--------------|---------------|
+| Stopped | Moved offline | Stopped on the target |
+| Running, live migration possible | Live migrated | Running, no downtime |
+| Running, live migration not possible | Shut down → moved → started | Running, brief downtime |
+
+`online` controls only whether live migration is *attempted* for a running
+guest: on by default for QEMU, off by default for LXC (live migration is
+experimental there, so `online: true` opts in). Either way a running guest ends
+up running — `online: false` means "don't live migrate", not "leave it off". The
+option is ignored for stopped guests.
+
+If the move fails after the guest has been shut down, it is started again on the
+source node so it is left as it was found. If that restart also fails, the tool
+says so explicitly and names the node it is stopped on.
 
 On PVE versions without the native LXC migrate endpoint, `migrate_guest` falls
 back to a clone: the source container is **stopped first**, cloned to the target
-under a new VMID, and the clone is started there. The stopped original is
-deliberately **left in place** — this server never deletes a guest — so verify
-the copy and remove the original yourself. Both the new VMID and the retained
+under a new VMID, and the clone is started there **only if the original was
+running**. The stopped original is deliberately **left in place** — this server
+never deletes a guest — so verify the copy and remove the original yourself. Both the new VMID and the retained
 original are named in the tool's output.
 
 ## Development

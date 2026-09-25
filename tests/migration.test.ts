@@ -368,6 +368,210 @@ describe("migration tools", () => {
       );
     });
 
+    // --- run state is preserved in both directions ---
+
+    it("should shut down, move and restart a running QEMU VM when live migration fails", async () => {
+      mockPvesh
+        .mockResolvedValueOnce({ status: "running" })   // resolveGuest
+        .mockResolvedValueOnce({ tags: "" })            // tag check
+        .mockRejectedValueOnce(new Error("can't migrate VM with local devices"))
+        .mockResolvedValueOnce("UPID:pve:1:shutdown")   // shutdown on source
+        .mockResolvedValueOnce("UPID:pve:2:migrate")    // offline move
+        .mockResolvedValueOnce("UPID:node2:3:start");   // start on target
+      mockWaitForTask.mockResolvedValue(undefined);
+
+      const result = await server.tools["migrate_guest"]({
+        node: "pve",
+        vmid: 100,
+        target_node: "node2",
+      });
+
+      const order = mockPvesh.mock.calls.map((c) => String(c[0]) + " " + String(c[1]));
+      expect(order).toContain("create /nodes/pve/qemu/100/status/shutdown");
+      expect(order).toContain("create /nodes/node2/qemu/100/status/start");
+      // The move itself is offline once live migration is off the table.
+      expect(mockPvesh).toHaveBeenCalledWith(
+        "create",
+        "/nodes/pve/qemu/100/migrate",
+        { target: "node2", bwlimit: 153600, online: 0 },
+        600000
+      );
+      // Shutdown precedes the move, which precedes the start.
+      expect(order.indexOf("create /nodes/pve/qemu/100/status/shutdown"))
+        .toBeLessThan(order.lastIndexOf("create /nodes/pve/qemu/100/migrate"));
+      expect(order.lastIndexOf("create /nodes/pve/qemu/100/migrate"))
+        .toBeLessThan(order.indexOf("create /nodes/node2/qemu/100/status/start"));
+      expect(result.content[0].text).toContain("It is running");
+    });
+
+    it("should not attempt live migration when online=false, but still end up running", async () => {
+      mockPvesh
+        .mockResolvedValueOnce({ status: "running" })
+        .mockResolvedValueOnce({ tags: "" })
+        .mockResolvedValueOnce("UPID:pve:1:shutdown")
+        .mockResolvedValueOnce("UPID:pve:2:migrate")
+        .mockResolvedValueOnce("UPID:node2:3:start");
+      mockWaitForTask.mockResolvedValue(undefined);
+
+      await server.tools["migrate_guest"]({
+        node: "pve",
+        vmid: 100,
+        target_node: "node2",
+        online: false,
+      });
+
+      // online=1 is never tried at all.
+      const live = mockPvesh.mock.calls.filter(
+        (c) => String(c[1]).endsWith("/migrate") && (c[2] as any)?.online === 1
+      );
+      expect(live).toHaveLength(0);
+      // ...but the VM is still running on the target afterwards.
+      expect(mockPvesh).toHaveBeenCalledWith(
+        "create", "/nodes/node2/qemu/100/status/start", {}, 120000
+      );
+    });
+
+    it("should restart a QEMU VM on the source if the move fails after shutdown", async () => {
+      mockPvesh
+        .mockResolvedValueOnce({ status: "running" })
+        .mockResolvedValueOnce({ tags: "" })
+        .mockRejectedValueOnce(new Error("live migration unavailable"))
+        .mockResolvedValueOnce("UPID:pve:1:shutdown")
+        .mockRejectedValueOnce(new Error("target storage full"))
+        .mockResolvedValueOnce("UPID:pve:2:start"); // restart on SOURCE
+      mockWaitForTask.mockResolvedValue(undefined);
+
+      await expect(
+        server.tools["migrate_guest"]({
+          node: "pve",
+          vmid: 100,
+          target_node: "node2",
+        })
+      ).rejects.toThrow(/restarted on 'pve'/);
+
+      // It goes back up where it came from, not on the target.
+      expect(mockPvesh).toHaveBeenCalledWith(
+        "create", "/nodes/pve/qemu/100/status/start", {}, 120000
+      );
+      const targetStarts = mockPvesh.mock.calls.filter(
+        (c) => String(c[1]) === "/nodes/node2/qemu/100/status/start"
+      );
+      expect(targetStarts).toHaveLength(0);
+    });
+
+    it("should report a VM left stopped when it cannot be restarted after a failed move", async () => {
+      mockPvesh
+        .mockResolvedValueOnce({ status: "running" })
+        .mockResolvedValueOnce({ tags: "" })
+        .mockRejectedValueOnce(new Error("live migration unavailable"))
+        .mockResolvedValueOnce("UPID:pve:1:shutdown")
+        .mockRejectedValueOnce(new Error("target storage full"))
+        .mockRejectedValueOnce(new Error("start failed"));
+      mockWaitForTask.mockResolvedValue(undefined);
+
+      await expect(
+        server.tools["migrate_guest"]({
+          node: "pve",
+          vmid: 100,
+          target_node: "node2",
+        })
+      ).rejects.toThrow(/could not be restarted.*It is stopped there/s);
+    });
+
+    it("should fall back to restart when requested LXC live migration fails", async () => {
+      mockPvesh
+        .mockRejectedValueOnce(new Error("nf"))         // resolveGuest: not qemu
+        .mockResolvedValueOnce({ status: "running" })   // resolveGuest: lxc running
+        .mockResolvedValueOnce({ tags: "" })
+        .mockRejectedValueOnce(new Error("live migration failed"))
+        .mockResolvedValueOnce("UPID:pve:1:move");
+      mockWaitForTask.mockResolvedValue(undefined);
+
+      await server.tools["migrate_guest"]({
+        node: "pve",
+        vmid: 200,
+        target_node: "node2",
+        online: true,
+      });
+
+      // restart=1 is PVE's own shutdown/move/start, so the CT ends up running.
+      expect(mockPvesh).toHaveBeenCalledWith(
+        "create",
+        "/nodes/pve/lxc/200/migrate",
+        { target: "node2", bwlimit: 153600, restart: 1 },
+        600000
+      );
+    });
+
+    it("should reach the clone fallback when online=true and the endpoint is missing", async () => {
+      mockPvesh
+        .mockRejectedValueOnce(new Error("nf"))               // not qemu
+        .mockResolvedValueOnce({ status: "running" })         // lxc, running
+        .mockResolvedValueOnce({ tags: "" })
+        .mockRejectedValueOnce(new Error(                     // live attempt: no endpoint
+          "no such resource '/nodes/pve/lxc/200/migrate'"
+        ))
+        .mockResolvedValueOnce({ hostname: "myct" })          // config
+        .mockResolvedValueOnce({ status: "running" })         // status
+        .mockResolvedValueOnce("UPID:pve:1:stop")
+        .mockResolvedValueOnce("UPID:pve:2:clone")
+        .mockResolvedValueOnce("UPID:node2:3:start");
+      mockGetNextVmid.mockResolvedValue(300);
+      mockWaitForTask.mockResolvedValue(undefined);
+
+      const result = await server.tools["migrate_guest"]({
+        node: "pve",
+        vmid: 200,
+        target_node: "node2",
+        online: true,
+      });
+
+      // A missing endpoint must not be mistaken for "live migration failed" and
+      // retried with restart=1 -- it goes to the clone fallback instead.
+      const restarts = mockPvesh.mock.calls.filter(
+        (c) => String(c[1]).endsWith("/migrate") && (c[2] as any)?.restart === 1
+      );
+      expect(restarts).toHaveLength(0);
+      expect(mockPvesh).toHaveBeenCalledWith(
+        "create",
+        "/nodes/pve/lxc/200/clone",
+        { target: "node2", newid: 300, hostname: "myct", full: 1 },
+        600000
+      );
+      expect(result.content[0].text).toContain("300");
+    });
+
+    it("clone fallback should leave a stopped container stopped on the target", async () => {
+      mockPvesh
+        .mockRejectedValueOnce(new Error("nf"))                // not qemu
+        .mockResolvedValueOnce({ status: "stopped" })          // lxc, stopped
+        .mockResolvedValueOnce({ tags: "" })
+        .mockRejectedValueOnce(new Error(                      // endpoint missing
+          "no such resource '/nodes/pve/lxc/132/migrate'"
+        ))
+        .mockResolvedValueOnce({ hostname: "wopr" })           // config
+        .mockResolvedValueOnce({ status: "stopped" })          // status: stopped
+        .mockResolvedValueOnce("UPID:pve:1:clone");            // clone
+      mockGetNextVmid.mockResolvedValue(300);
+      mockWaitForTask.mockResolvedValue(undefined);
+
+      await server.tools["migrate_guest"]({
+        node: "pve",
+        vmid: 132,
+        target_node: "node2",
+      });
+
+      // Nothing is stopped (it already was) and nothing is started.
+      const starts = mockPvesh.mock.calls.filter((c) =>
+        String(c[1]).endsWith("/status/start")
+      );
+      expect(starts).toHaveLength(0);
+      const stops = mockPvesh.mock.calls.filter((c) =>
+        String(c[1]).endsWith("/status/stop")
+      );
+      expect(stops).toHaveLength(0);
+    });
+
     it("should use PVE's hyphenated target-storage on the LXC endpoint", async () => {
       mockPvesh
         .mockRejectedValueOnce(new Error("nf"))
@@ -689,11 +893,16 @@ describe("migration tools", () => {
         .mockResolvedValueOnce({ tags: "" })
         // config 101
         .mockResolvedValueOnce({ tags: "" })
-        // migrate 100 → succeeds
+        // migrate 100 → succeeds live
         .mockResolvedValueOnce(null)
-        // migrate 101 → fails
-        .mockRejectedValueOnce(new Error("network timeout"));
-      mockWaitForTask.mockResolvedValueOnce(undefined);
+        // 101: live migrate fails, so the shutdown/move/start path is tried
+        .mockRejectedValueOnce(new Error("network timeout"))
+        .mockResolvedValueOnce("UPID:pve:1:shutdown")
+        // ...and the offline move fails too
+        .mockRejectedValueOnce(new Error("network timeout"))
+        // ...so 101 is restarted on the source, as it was found
+        .mockResolvedValueOnce("UPID:pve:2:start");
+      mockWaitForTask.mockResolvedValue(undefined);
 
       const result = await server.tools["drain_node"]({
         source_node: "pve",
