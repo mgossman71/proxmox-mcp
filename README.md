@@ -34,7 +34,7 @@ P="$P,VM.Config.CPU,VM.Config.Memory,VM.Config.Disk"
 P="$P,VM.Config.Network,VM.Config.Options"
 P="$P,VM.Config.CDROM,VM.Config.HWType"
 P="$P,Datastore.Audit,Datastore.AllocateSpace,SDN.Use"
-P="$P,VM.GuestAgent.Audit"
+P="$P,VM.Monitor"
 pveum role add MCPOperator -privs "$P"
 
 # Dedicated user in the Proxmox realm (no Linux account, no shell)
@@ -58,7 +58,7 @@ straight into `.env.local` without being copied by hand.
 | `VM.Allocate`, `VM.Config.*`, `Datastore.AllocateSpace`, `SDN.Use` | `create_vm`, `create_container` (disks on storage, NIC on `vmbr0`) |
 | `VM.Clone` | `clone_guest` |
 | `VM.Migrate` | `migrate_guest`, `drain_node` |
-| `VM.GuestAgent.Audit` | `get_guest_filesystems` on QEMU VMs (PVE 9; on PVE 8 use `VM.Monitor`) |
+| `VM.Monitor` | `get_guest_filesystems` on QEMU VMs (the guest agent endpoints check this privilege) |
 
 If a tool fails with `HTTP 403: Permission check failed (/path, Priv.Name)`,
 the message names the missing privilege. Add it with
