@@ -3,12 +3,12 @@ import { z } from "zod";
 /**
  * Strict pattern for Proxmox API path segments (node names, storage pool names).
  *
- * These values are interpolated directly into the `pvesh` API path that is
- * executed on the remote host over SSH. Restricting them to a safe character
- * set (alphanumerics plus `-` and `_`, and not starting with a separator)
- * prevents shell/path injection. The MCP SDK validates tool input against these
- * schemas before the handler runs, so a hostile value such as `pve; reboot` is
- * rejected at the boundary and never reaches the remote shell.
+ * These values are interpolated directly into the Proxmox API URL path.
+ * Restricting them to a safe character set (alphanumerics plus `-` and `_`,
+ * and not starting with a separator) prevents path traversal or query
+ * injection. The MCP SDK validates tool input against these schemas before the
+ * handler runs, so a hostile value such as `../access/users` or `pve?x=1` is
+ * rejected at the boundary and never reaches the API.
  */
 const SAFE_PATH_SEGMENT = /^[a-zA-Z0-9][a-zA-Z0-9_-]*$/;
 

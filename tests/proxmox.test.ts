@@ -1,10 +1,16 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
+import { EventEmitter } from "events";
 import os from "os";
 
-// Mock child_process before importing the module under test
-const mockExecFile = vi.fn();
-vi.mock("child_process", () => ({
-  execFile: (...args: any[]) => mockExecFile(...args),
+// Mock https before importing the module under test
+const { mockRequest } = vi.hoisted(() => ({ mockRequest: vi.fn() }));
+vi.mock("https", () => ({
+  default: {
+    request: (...args: any[]) => mockRequest(...args),
+    Agent: class {
+      constructor(public options: any) {}
+    },
+  },
 }));
 
 import {
@@ -21,29 +27,63 @@ import {
   ProxmoxParseError,
 } from "../src/proxmox.js";
 
-// Helper to simulate execFile success
-function mockSshSuccess(stdout: string) {
-  mockExecFile.mockImplementation(
-    (_cmd: string, _args: string[], _opts: any, callback: Function) => {
-      callback(null, { stdout, stderr: "" });
-    }
-  );
+process.env.PROXMOX_HOST = "pve.test";
+process.env.PROXMOX_TOKEN_ID = "mcp@pve!mcp";
+process.env.PROXMOX_TOKEN_SECRET = "secret-uuid";
+
+interface CapturedRequest {
+  method: string;
+  url: string;
+  headers: Record<string, string>;
+  body: string;
+  options: any;
 }
 
-// Helper to simulate execFile failure
-function mockSshFailure(code: number, stderr: string) {
-  mockExecFile.mockImplementation(
-    (_cmd: string, _args: string[], _opts: any, callback: Function) => {
-      const err: any = new Error(`ssh: exit code ${code}`);
-      err.code = code;
-      err.stderr = stderr;
-      callback(err, { stdout: "", stderr });
-    }
-  );
+type Reply = { status?: number; statusText?: string; body?: string } | Error;
+
+let requests: CapturedRequest[] = [];
+
+// Answer each https.request with whatever `reply` returns for it
+function mockApi(reply: (req: CapturedRequest) => Reply) {
+  mockRequest.mockImplementation((url: string, options: any, callback: Function) => {
+    const req: any = new EventEmitter();
+    let body = "";
+    req.write = (chunk: string) => { body += chunk; };
+    req.destroy = (err?: Error) => { if (err) req.emit("error", err); };
+    req.end = () => {
+      queueMicrotask(() => {
+        const captured = { method: options.method, url, headers: options.headers, body, options };
+        requests.push(captured);
+        const r = reply(captured);
+        if (r instanceof Error) {
+          req.emit("error", r);
+          return;
+        }
+        const res: any = new EventEmitter();
+        res.statusCode = r.status ?? 200;
+        res.statusMessage = r.statusText ?? "OK";
+        callback(res);
+        if (r.body) res.emit("data", Buffer.from(r.body));
+        res.emit("end");
+      });
+    };
+    return req;
+  });
+}
+
+// Helper to simulate a successful API call returning `data`
+function mockData(data: any) {
+  mockApi(() => ({ body: JSON.stringify({ data }) }));
+}
+
+// Helper to simulate a non-2xx API response
+function mockHttpError(status: number, statusText: string, body = '{"data":null}') {
+  mockApi(() => ({ status, statusText, body }));
 }
 
 beforeEach(() => {
   vi.resetAllMocks();
+  requests = [];
 });
 
 // --- ProxmoxError ---
@@ -65,7 +105,6 @@ describe("ProxmoxError", () => {
   });
 });
 
-// --- expandHome (tested indirectly through SSH_KEY setup) ---
 // --- expandHome ---
 
 describe("expandHome", () => {
@@ -78,122 +117,122 @@ describe("expandHome", () => {
   });
 });
 
-// --- ssh (private, tested through pvesh) ---
+// --- pvesh (HTTPS transport) ---
 
 describe("pvesh", () => {
-  it("should parse JSON response", async () => {
+  it("should unwrap the data field", async () => {
     const data = [{ node: "pve", status: "online" }];
-    mockSshSuccess(JSON.stringify(data));
+    mockData(data);
     const result = await pvesh("get", "/cluster/status");
     expect(result).toEqual(data);
   });
 
-  it("should return null for empty output", async () => {
-    mockSshSuccess("");
-    const result = await pvesh("get", "/nodes/pve/qemu/999/config");
-    expect(result).toBeNull();
+  it("should return null when data is null", async () => {
+    mockData(null);
+    expect(await pvesh("get", "/nodes/pve/qemu/999/config")).toBeNull();
   });
 
-  it("should extract UPID from multi-line output", async () => {
-    const output = "Logical volume \"vm-105-disk-0\" created.\nCreating filesystem...\nUPID:pve:001:310DCDBB:6AB30176:vzcreate:105:root@pam:";
-    mockSshSuccess(output);
+  it("should return null for an empty body", async () => {
+    mockApi(() => ({ body: "" }));
+    expect(await pvesh("get", "/cluster/status")).toBeNull();
+  });
+
+  it("should return a UPID string from task endpoints", async () => {
+    mockData("UPID:pve:001:310DCDBB:6AB30176:vzcreate:105:mcp@pve!mcp:");
     const result = await pvesh("create", "/nodes/pve/lxc", {});
-    expect(result).toBe("UPID:pve:001:310DCDBB:6AB30176:vzcreate:105:root@pam:");
+    expect(result).toBe("UPID:pve:001:310DCDBB:6AB30176:vzcreate:105:mcp@pve!mcp:");
   });
 
-  it("should find JSON in multi-line output", async () => {
-    const output = "Some progress text\n{\"result\":true}\nmore text";
-    mockSshSuccess(output);
-    const result = await pvesh("get", "/test");
-    expect(result).toEqual({ result: true });
+  it.each([
+    ["get", "GET"],
+    ["create", "POST"],
+    ["set", "PUT"],
+    ["delete", "DELETE"],
+  ] as const)("should map %s to %s", async (method, verb) => {
+    mockData(null);
+    await pvesh(method, "/test");
+    expect(requests[0].method).toBe(verb);
   });
 
-  it("should throw ProxmoxError for unparseable output", async () => {
-    mockSshSuccess("some random non-JSON text without UPID");
-    await expect(pvesh("get", "/test")).rejects.toThrow(ProxmoxError);
-    await expect(pvesh("get", "/test")).rejects.toThrow("Failed to parse pvesh response");
-  });
-
-  it("should throw ProxmoxError on SSH failure", async () => {
-    mockSshFailure(255, "Connection refused");
-    await expect(pvesh("get", "/cluster/status")).rejects.toThrow(ProxmoxError);
-    await expect(pvesh("get", "/cluster/status")).rejects.toThrow("Connection refused");
-  });
-
-  it("should use error.message when stderr is empty", async () => {
-    mockExecFile.mockImplementation(
-      (_cmd: string, _args: string[], _opts: any, callback: Function) => {
-        const err: any = new Error("Operation timed out");
-        err.code = 124;
-        err.stderr = "";
-        callback(err, { stdout: "", stderr: "" });
-      }
-    );
-    await expect(pvesh("get", "/cluster/status")).rejects.toThrow("Operation timed out");
-  });
-
-  it("should use fallback message when both stderr and message are empty", async () => {
-    mockExecFile.mockImplementation(
-      (_cmd: string, _args: string[], _opts: any, callback: Function) => {
-        const err: any = new Error("");
-        err.code = 1;
-        err.stderr = "";
-        callback(err, { stdout: "", stderr: "" });
-      }
-    );
-    await expect(pvesh("get", "/cluster/status")).rejects.toThrow("Unknown SSH error");
-  });
-
-  it("should default exit code to 1 when code is undefined", async () => {
-    mockExecFile.mockImplementation(
-      (_cmd: string, _args: string[], _opts: any, callback: Function) => {
-        const err: any = new Error("failed");
-        delete err.code;
-        err.stderr = "some error";
-        callback(err, { stdout: "", stderr: "some error" });
-      }
-    );
-    try {
-      await pvesh("get", "/cluster/status");
-    } catch (e: any) {
-      expect(e.exitCode).toBe(1);
-      expect(e.message).toContain("exit ?");
-    }
-  });
-
-  it("should pass boolean params as --key 1", async () => {
-    mockSshSuccess("null");
-    const result = await pvesh("create", "/nodes/pve/qemu", { onboot: true, agent: false });
-    expect(result).toBeNull();
-    const call = mockExecFile.mock.calls[0];
-    const remoteCmd = call[1][call[1].length - 1];
-    expect(remoteCmd).toContain("--onboot 1");
-    expect(remoteCmd).not.toContain("--agent");
-  });
-
-  it("should pass string/number params with quoting", async () => {
-    mockSshSuccess("null");
-    await pvesh("create", "/nodes/pve/qemu", { name: "test-vm", cores: 4 });
-    const call = mockExecFile.mock.calls[0];
-    const remoteCmd = call[1][call[1].length - 1];
-    expect(remoteCmd).toContain("--name 'test-vm'");
-    expect(remoteCmd).toContain("--cores '4'");
-  });
-
-  it("should shell-quote single quotes in values", async () => {
-    mockSshSuccess("null");
-    await pvesh("set", "/nodes/pve/qemu/100/config", { name: "it's a test" });
-    const call = mockExecFile.mock.calls[0];
-    const remoteCmd = call[1][call[1].length - 1];
-    expect(remoteCmd).toContain(`--name 'it'\\''s a test'`);
-  });
-
-  it("should include --output-format json in command", async () => {
-    mockSshSuccess("null");
+  it("should call the configured API base URL", async () => {
+    mockData(null);
     await pvesh("get", "/cluster/status");
-    const call = mockExecFile.mock.calls[0];
-    const remoteCmd = call[1][call[1].length - 1];
-    expect(remoteCmd).toContain("--output-format json");
+    expect(requests[0].url).toBe("https://pve.test:8006/api2/json/cluster/status");
+  });
+
+  it("should send the API token in the Authorization header", async () => {
+    mockData(null);
+    await pvesh("get", "/cluster/status");
+    expect(requests[0].headers.Authorization).toBe("PVEAPIToken=mcp@pve!mcp=secret-uuid");
+  });
+
+  it("should send GET params as a query string", async () => {
+    mockData(null);
+    await pvesh("get", "/nodes/pve/storage", { content: "iso", enabled: true });
+    expect(requests[0].url).toBe("https://pve.test:8006/api2/json/nodes/pve/storage?content=iso&enabled=1");
+    expect(requests[0].body).toBe("");
+  });
+
+  it("should send POST params as a form body", async () => {
+    mockData(null);
+    await pvesh("create", "/nodes/pve/qemu", { name: "test-vm", cores: 4 });
+    expect(requests[0].url).toBe("https://pve.test:8006/api2/json/nodes/pve/qemu");
+    expect(requests[0].headers["Content-Type"]).toBe("application/x-www-form-urlencoded");
+    expect(requests[0].body).toBe("name=test-vm&cores=4");
+  });
+
+  it("should pass booleans as 1 and 0", async () => {
+    mockData(null);
+    await pvesh("set", "/nodes/pve/qemu/100/config", { onboot: false, agent: true });
+    expect(requests[0].body).toBe("onboot=0&agent=1");
+  });
+
+  it("should form-encode special characters in values", async () => {
+    mockData(null);
+    await pvesh("create", "/nodes/pve/qemu", { net0: "virtio=BC:24:11:AA:BB:CC,bridge=vmbr0", name: "it's a test" });
+    const form = new URLSearchParams(requests[0].body);
+    expect(form.get("net0")).toBe("virtio=BC:24:11:AA:BB:CC,bridge=vmbr0");
+    expect(form.get("name")).toBe("it's a test");
+  });
+
+  it("should pass the timeout to the request", async () => {
+    mockData(null);
+    await pvesh("create", "/test", {}, 1234);
+    expect(requests[0].options.timeout).toBe(1234);
+  });
+
+  it("should throw ProxmoxError with status and reason on HTTP errors", async () => {
+    mockHttpError(403, "Permission check failed (/vms/100, VM.Audit)");
+    const err = await pvesh("get", "/nodes/pve/qemu/100/config").catch((e) => e);
+    expect(err).toBeInstanceOf(ProxmoxError);
+    expect(err.message).toBe("HTTP 403: Permission check failed (/vms/100, VM.Audit)");
+    expect(err.exitCode).toBe(403);
+  });
+
+  it("should include parameter errors in the message", async () => {
+    mockHttpError(400, "Parameter verification failed.", JSON.stringify({ data: null, errors: { vmid: "invalid format" } }));
+    await expect(pvesh("create", "/nodes/pve/qemu", { vmid: "x" })).rejects.toThrow(
+      'HTTP 400: Parameter verification failed. {"vmid":"invalid format"}'
+    );
+  });
+
+  it("should keep 501 in the message so missing endpoints are detectable", async () => {
+    mockHttpError(501, "Method 'POST /nodes/pve/lxc/100/migrate' not implemented");
+    await expect(pvesh("create", "/nodes/pve/lxc/100/migrate")).rejects.toThrow(/501.*not implemented/);
+  });
+
+  it("should throw ProxmoxError on network failure", async () => {
+    mockApi(() => new Error("connect ECONNREFUSED 10.0.0.19:8006"));
+    const err = await pvesh("get", "/cluster/status").catch((e) => e);
+    expect(err).toBeInstanceOf(ProxmoxError);
+    expect(err.message).toContain("ECONNREFUSED");
+  });
+
+  it("should throw ProxmoxParseError for a non-JSON body", async () => {
+    mockApi(() => ({ body: "<html>proxy error</html>" }));
+    const err = await pvesh("get", "/test").catch((e) => e);
+    expect(err).toBeInstanceOf(ProxmoxParseError);
+    expect(err.message).toContain("Failed to parse Proxmox API response");
   });
 });
 
@@ -205,7 +244,7 @@ describe("getGuestInfo", () => {
       { vmid: 100, type: "qemu", name: "MyVM", node: "pve", status: "running" },
       { vmid: 101, type: "lxc", name: "MyCT", node: "pve", status: "running" },
     ];
-    mockSshSuccess(JSON.stringify(resources));
+    mockData(resources);
     const result = await getGuestInfo(100);
     expect(result).toEqual({
       node: "pve", type: "qemu", name: "MyVM", running: true,
@@ -217,7 +256,7 @@ describe("getGuestInfo", () => {
       { vmid: 100, type: "qemu", name: "MyVM", node: "pve", status: "running" },
       { vmid: 101, type: "lxc", name: "MyCT", node: "pve2", status: "stopped" },
     ];
-    mockSshSuccess(JSON.stringify(resources));
+    mockData(resources);
     const result = await getGuestInfo(101);
     expect(result).toEqual({
       node: "pve2", type: "lxc", name: "MyCT", running: false,
@@ -226,12 +265,12 @@ describe("getGuestInfo", () => {
 
   it("should throw when VMID not found", async () => {
     const resources = [{ vmid: 100, type: "qemu", name: "MyVM", node: "pve" }];
-    mockSshSuccess(JSON.stringify(resources));
+    mockData(resources);
     await expect(getGuestInfo(999)).rejects.toThrow("VMID 999 not found in cluster");
   });
 
   it("should throw when cluster resources returns non-array", async () => {
-    mockSshSuccess(JSON.stringify({ error: "bad" }));
+    mockData({ error: "bad" });
     await expect(getGuestInfo(100)).rejects.toThrow(
       "Unexpected (non-array) response from /cluster/resources"
     );
@@ -242,7 +281,7 @@ describe("getGuestInfo", () => {
 
 describe("getNextVmid", () => {
   it("should return 100 when no VMs exist", async () => {
-    mockSshSuccess(JSON.stringify([]));
+    mockData([]);
     const result = await getNextVmid();
     expect(result).toBe(100);
   });
@@ -256,13 +295,13 @@ describe("getNextVmid", () => {
       { type: "node" },
       { type: "storage" },
     ];
-    mockSshSuccess(JSON.stringify(resources));
+    mockData(resources);
     const result = await getNextVmid();
     expect(result).toBe(104);
   });
 
   it("should throw when cluster resources returns non-array", async () => {
-    mockSshSuccess(JSON.stringify({ error: "bad" }));
+    mockData({ error: "bad" });
     await expect(getNextVmid()).rejects.toThrow(
       "Unexpected (non-array) response from /cluster/resources"
     );
@@ -299,159 +338,116 @@ describe("generateMac", () => {
 // --- waitForTask ---
 
 describe("waitForTask", () => {
+  const UPID = "UPID:pve:123:456:789:task:mcp@pve!mcp:";
+
   it("should return immediately for null upid", async () => {
     await expect(waitForTask("pve", null)).resolves.toBeUndefined();
-    expect(mockExecFile).not.toHaveBeenCalled();
+    expect(mockRequest).not.toHaveBeenCalled();
   });
 
   it("should return immediately for undefined upid", async () => {
     await expect(waitForTask("pve", undefined)).resolves.toBeUndefined();
-    expect(mockExecFile).not.toHaveBeenCalled();
+    expect(mockRequest).not.toHaveBeenCalled();
   });
 
   it("should return immediately for non-UPID string", async () => {
     await expect(waitForTask("pve", "not-a-upid")).resolves.toBeUndefined();
-    expect(mockExecFile).not.toHaveBeenCalled();
+    expect(mockRequest).not.toHaveBeenCalled();
   });
 
   it("should return immediately for non-string upid", async () => {
     await expect(waitForTask("pve", 123 as any)).resolves.toBeUndefined();
-    expect(mockExecFile).not.toHaveBeenCalled();
+    expect(mockRequest).not.toHaveBeenCalled();
   });
 
   it("should resolve when task completes with OK status", async () => {
-    mockSshSuccess(JSON.stringify({ status: "stopped", exitstatus: "OK" }));
-    await expect(waitForTask("pve", "UPID:pve:123:456:789:task:root@pam:")).resolves.toBeUndefined();
+    mockData({ status: "stopped", exitstatus: "OK" });
+    await expect(waitForTask("pve", UPID)).resolves.toBeUndefined();
   });
 
   it("should poll until task completes", async () => {
     let callCount = 0;
-    mockExecFile.mockImplementation(
-      (_cmd: string, _args: string[], _opts: any, callback: Function) => {
-        callCount++;
-        const status = callCount < 3
-          ? { status: "running", exitstatus: "OK" }
-          : { status: "stopped", exitstatus: "OK" };
-        callback(null, { stdout: JSON.stringify(status), stderr: "" });
-      }
-    );
-    await expect(waitForTask("pve", "UPID:pve:123:456:789:task:root@pam:")).resolves.toBeUndefined();
+    mockApi(() => {
+      callCount++;
+      const status = callCount < 3
+        ? { status: "running", exitstatus: "OK" }
+        : { status: "stopped", exitstatus: "OK" };
+      return { body: JSON.stringify({ data: status }) };
+    });
+    await expect(waitForTask("pve", UPID)).resolves.toBeUndefined();
     expect(callCount).toBe(3);
   });
 
-  it("should throw when task fails and log is available", async () => {
-    mockExecFile.mockImplementation(
-      (_cmd: string, args: string[], _opts: any, callback: Function) => {
-        const remoteCmd = args[args.length - 1];
-        if (remoteCmd.includes("/status")) {
-          callback(null, { stdout: JSON.stringify({ status: "stopped", exitstatus: "ERROR" }), stderr: "" });
-        } else if (remoteCmd.includes("/log")) {
-          callback(null, { stdout: JSON.stringify(["line1", "line2", "ERROR: disk full"]), stderr: "" });
-        } else {
-          callback(null, { stdout: "", stderr: "" });
-        }
-      }
+  it("should URL-encode the UPID in the task path", async () => {
+    mockData({ status: "stopped", exitstatus: "OK" });
+    await waitForTask("pve", "UPID:pve:123:456:789:task:mcp@pve!mcp:");
+    expect(requests[0].url).toBe(
+      "https://pve.test:8006/api2/json/nodes/pve/tasks/UPID%3Apve%3A123%3A456%3A789%3Atask%3Amcp%40pve!mcp%3A/status"
     );
-    await expect(waitForTask("pve", "UPID:pve:123:456:789:task:root@pam:")).rejects.toThrow(
-      "Task UPID:pve:123:456:789:task:root@pam: failed"
+  });
+
+  // Fail the task, and answer the log request with `log`
+  function mockFailedTask(log: Reply) {
+    mockApi((req) => {
+      if (req.url.endsWith("/status")) {
+        return { body: JSON.stringify({ data: { status: "stopped", exitstatus: "ERROR" } }) };
+      }
+      return log;
+    });
+  }
+
+  it("should throw with the log tail when task fails", async () => {
+    mockFailedTask({
+      body: JSON.stringify({
+        data: [
+          { n: 1, t: "line1" },
+          { n: 2, t: "line2" },
+          { n: 3, t: "ERROR: disk full" },
+        ],
+      }),
+    });
+    await expect(waitForTask("pve", UPID)).rejects.toThrow(
+      `Task ${UPID} failed: line1\nline2\nERROR: disk full`
     );
   });
 
   it("should throw when task fails and log fetch also fails", async () => {
-    mockExecFile.mockImplementation(
-      (_cmd: string, args: string[], _opts: any, callback: Function) => {
-        const remoteCmd = args[args.length - 1];
-        if (remoteCmd.includes("/status")) {
-          callback(null, { stdout: JSON.stringify({ status: "stopped", exitstatus: "ERROR" }), stderr: "" });
-        } else {
-          const err: any = new Error("log fetch failed");
-          err.code = 1;
-          err.stderr = "no log";
-          callback(err, { stdout: "", stderr: "no log" });
-        }
-      }
-    );
-    await expect(waitForTask("pve", "UPID:pve:123:456:789:task:root@pam:")).rejects.toThrow(
-      "Task UPID:pve:123:456:789:task:root@pam: failed: exitstatus=ERROR"
+    mockFailedTask({ status: 500, statusText: "no log" });
+    await expect(waitForTask("pve", UPID)).rejects.toThrow(
+      `Task ${UPID} failed: exitstatus=ERROR`
     );
   });
 
   it("should handle log returning empty array", async () => {
-    mockExecFile.mockImplementation(
-      (_cmd: string, args: string[], _opts: any, callback: Function) => {
-        const remoteCmd = args[args.length - 1];
-        if (remoteCmd.includes("/status")) {
-          callback(null, { stdout: JSON.stringify({ status: "stopped", exitstatus: "ERROR" }), stderr: "" });
-        } else if (remoteCmd.includes("/log")) {
-          callback(null, { stdout: "[]", stderr: "" });
-        } else {
-          callback(null, { stdout: "", stderr: "" });
-        }
-      }
-    );
-    await expect(waitForTask("pve", "UPID:pve:123:456:789:task:root@pam:")).rejects.toThrow(
-      "failed: exitstatus=ERROR"
-    );
+    mockFailedTask({ body: JSON.stringify({ data: [] }) });
+    await expect(waitForTask("pve", UPID)).rejects.toThrow("failed: exitstatus=ERROR");
   });
 
   it("should handle log returning non-array value", async () => {
-    mockExecFile.mockImplementation(
-      (_cmd: string, args: string[], _opts: any, callback: Function) => {
-        const remoteCmd = args[args.length - 1];
-        if (remoteCmd.includes("/status")) {
-          callback(null, { stdout: JSON.stringify({ status: "stopped", exitstatus: "ERROR" }), stderr: "" });
-        } else if (remoteCmd.includes("/log")) {
-          callback(null, { stdout: JSON.stringify("single line error"), stderr: "" });
-        } else {
-          callback(null, { stdout: "", stderr: "" });
-        }
-      }
-    );
-    await expect(waitForTask("pve", "UPID:pve:123:456:789:task:root@pam:")).rejects.toThrow(
-      "failed"
-    );
+    mockFailedTask({ body: JSON.stringify({ data: "single line error" }) });
+    await expect(waitForTask("pve", UPID)).rejects.toThrow("failed: single line error");
   });
 
   it("should handle log returning null", async () => {
-    mockExecFile.mockImplementation(
-      (_cmd: string, args: string[], _opts: any, callback: Function) => {
-        const remoteCmd = args[args.length - 1];
-        if (remoteCmd.includes("/status")) {
-          callback(null, { stdout: JSON.stringify({ status: "stopped", exitstatus: "ERROR" }), stderr: "" });
-        } else if (remoteCmd.includes("/log")) {
-          callback(null, { stdout: "", stderr: "" });
-        } else {
-          callback(null, { stdout: "", stderr: "" });
-        }
-      }
-    );
-    await expect(waitForTask("pve", "UPID:pve:123:456:789:task:root@pam:")).rejects.toThrow(
-      "failed: exitstatus=ERROR"
-    );
+    mockFailedTask({ body: JSON.stringify({ data: null }) });
+    await expect(waitForTask("pve", UPID)).rejects.toThrow("failed: exitstatus=ERROR");
   });
 
   it("should throw on timeout", async () => {
-    mockSshSuccess(JSON.stringify({ status: "running", exitstatus: "OK" }));
+    mockData({ status: "running", exitstatus: "OK" });
     // Use a very short timeout to trigger timeout path
-    await expect(
-      waitForTask("pve", "UPID:pve:123:456:789:task:root@pam:", 1)
-    ).rejects.toThrow("Timed out waiting for task");
+    await expect(waitForTask("pve", UPID, 1)).rejects.toThrow("Timed out waiting for task");
   });
 
   it("should keep polling on transient parse errors", async () => {
     let callCount = 0;
-    mockExecFile.mockImplementation(
-      (_cmd: string, _args: string[], _opts: any, callback: Function) => {
-        callCount++;
-        if (callCount === 1) {
-          // First call returns unparseable data (simulating race)
-          callback(null, { stdout: "garbage not json", stderr: "" });
-        } else {
-          callback(null, { stdout: JSON.stringify({ status: "stopped", exitstatus: "OK" }), stderr: "" });
-        }
-      }
-    );
-    await expect(waitForTask("pve", "UPID:pve:123:456:789:task:root@pam:")).resolves.toBeUndefined();
+    mockApi(() => {
+      callCount++;
+      // First call returns unparseable data (simulating race)
+      if (callCount === 1) return { body: "garbage not json" };
+      return { body: JSON.stringify({ data: { status: "stopped", exitstatus: "OK" } }) };
+    });
+    await expect(waitForTask("pve", UPID)).resolves.toBeUndefined();
     expect(callCount).toBeGreaterThanOrEqual(2);
   });
 });
@@ -459,60 +455,33 @@ describe("waitForTask", () => {
 // --- resolveGuest ---
 
 describe("resolveGuest", () => {
+  const notFound = { status: 500, statusText: "Configuration file does not exist" };
+
   it("should find QEMU VM on the specified node", async () => {
-    mockSshSuccess(JSON.stringify({ status: "running" }));
+    mockData({ status: "running" });
     const result = await resolveGuest("pve", 100);
     expect(result).toEqual({ node: "pve", type: "qemu", running: true });
-    expect(mockExecFile).toHaveBeenCalledTimes(1);
+    expect(mockRequest).toHaveBeenCalledTimes(1);
   });
 
   it("should fall back to LXC when QEMU is not found", async () => {
-    mockExecFile.mockImplementation(
-      (_cmd: string, _args: string[], _opts: any, callback: Function) => {
-        callback(new Error("not found"), { stdout: "", stderr: "not found" });
-      }
-    );
-    // Override: first call (qemu) fails, second call (lxc) succeeds
-    let callCount = 0;
-    mockExecFile.mockImplementation(
-      (_cmd: string, _args: string[], _opts: any, callback: Function) => {
-        callCount++;
-        if (callCount === 1) {
-          const err: any = new Error("not found");
-          err.code = 1;
-          err.stderr = "not found";
-          callback(err, { stdout: "", stderr: "not found" });
-        } else {
-          callback(null, { stdout: JSON.stringify({ status: "running" }), stderr: "" });
-        }
-      }
+    mockApi((req) =>
+      req.url.includes("/qemu/") ? notFound : { body: JSON.stringify({ data: { status: "running" } }) }
     );
     const result = await resolveGuest("pve", 101);
     expect(result).toEqual({ node: "pve", type: "lxc", running: true });
-    expect(callCount).toBe(2);
+    expect(requests).toHaveLength(2);
   });
 
   it("should fall back to cluster search when not on specified node", async () => {
-    let callCount = 0;
-    mockExecFile.mockImplementation(
-      (_cmd: string, _args: string[], _opts: any, callback: Function) => {
-        callCount++;
-        if (callCount <= 2) {
-          const err: any = new Error("not found");
-          err.code = 1;
-          err.stderr = "not found";
-          callback(err, { stdout: "", stderr: "not found" });
-        } else {
-          // cluster/resources response
-          callback(null, {
-            stdout: JSON.stringify([
-              { vmid: 200, type: "qemu", name: "RemoteVM", node: "node2", status: "running" },
-            ]),
-            stderr: "",
-          });
-        }
-      }
-    );
+    mockApi((req) => {
+      if (!req.url.endsWith("/cluster/resources")) return notFound;
+      return {
+        body: JSON.stringify({
+          data: [{ vmid: 200, type: "qemu", name: "RemoteVM", node: "node2", status: "running" }],
+        }),
+      };
+    });
     const result = await resolveGuest("pve", 200);
     expect(result).toEqual({ node: "node2", type: "qemu", running: true });
   });

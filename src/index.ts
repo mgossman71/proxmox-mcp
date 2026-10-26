@@ -1,4 +1,7 @@
-import "dotenv/config";
+import dotenv from "dotenv";
+// .env.local (untracked) holds secrets such as PROXMOX_TOKEN_SECRET and wins
+// over the tracked .env.
+dotenv.config({ path: [".env.local", ".env"], quiet: true });
 import { randomUUID } from "crypto";
 import express from "express";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -6,6 +9,7 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { createServer } from "./server.js";
 import { bearerAuth } from "./auth.js";
 import { noMigrateTag } from "./tools/migration.js";
+import { apiBaseUrl, tlsInsecure } from "./proxmox.js";
 
 const PORT = parseInt(process.env.MCP_PORT || "3000", 10);
 // Shared-secret auth for /mcp. When unset, requests are allowed (a warning is
@@ -86,15 +90,22 @@ app.listen(PORT, () => {
   console.log(`Proxmox MCP server listening on http://0.0.0.0:${PORT}`);
   console.log(`  MCP endpoint:   http://0.0.0.0:${PORT}/mcp`);
   console.log(`  Health check:   http://0.0.0.0:${PORT}/health`);
-  console.log(`  SSH target:     ${process.env.PROXMOX_SSH_USER || "root"}@${process.env.PROXMOX_SSH_HOST}`);
+  console.log(`  Proxmox API:    ${apiBaseUrl()} (token ${process.env.PROXMOX_TOKEN_ID})`);
   console.log(`  Default node:   ${process.env.PROXMOX_NODE || "pve"}`);
   console.log(`  No-migrate tag: ${noMigrateTag()} (case-insensitive)`);
   // Fail-loud about missing configuration.
-  if (!process.env.PROXMOX_SSH_HOST) {
+  const missing = ["PROXMOX_HOST", "PROXMOX_TOKEN_ID", "PROXMOX_TOKEN_SECRET"]
+    .filter((name) => !process.env[name]);
+  if (missing.length > 0) {
     console.error(
-      "  ✗ PROXMOX_SSH_HOST is not set. Set it in your .env file."
+      `  ✗ ${missing.join(", ")} not set. Set them in .env / .env.local.`
     );
     process.exit(1);
+  }
+  if (tlsInsecure()) {
+    console.warn(
+      "  ⚠ PROXMOX_TLS_INSECURE=true; the Proxmox certificate is NOT verified. Set PROXMOX_CA_CERT to /etc/pve/pve-root-ca.pem instead."
+    );
   }
   if (!MCP_AUTH_TOKEN) {
     console.warn(

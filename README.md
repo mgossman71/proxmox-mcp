@@ -1,6 +1,6 @@
 # Proxmox MCP Server
 
-A [Model Context Protocol](https://modelcontextprotocol.io/) server for managing [Proxmox VE](https://www.proxmox.com/) clusters. Connects to Proxmox via SSH and uses `pvesh` for all API operations.
+A [Model Context Protocol](https://modelcontextprotocol.io/) server for managing [Proxmox VE](https://www.proxmox.com/) clusters. Talks to the Proxmox VE REST API over HTTPS using a scoped API token. No SSH access to the hypervisor is needed.
 
 ## Architecture
 
@@ -8,35 +8,88 @@ A [Model Context Protocol](https://modelcontextprotocol.io/) server for managing
 Claude / Cline (MCP Client)
     ↕ HTTP (Streamable HTTP transport)
 Proxmox MCP Server (Docker container)
-    ↕ SSH (key-based auth)
-Proxmox VE (pvesh)
+    ↕ HTTPS :8006 (API token: mcp@pve!mcp)
+Proxmox VE REST API (/api2/json)
 ```
 
 ## Prerequisites
 
 - Proxmox VE 8.x or later (tested on 9.2)
-- Your SSH public key added to the Proxmox host (`~/.ssh/authorized_keys`)
-- Docker + Docker Compose
+- A Proxmox API token for a dedicated user (see step 1)
+- Docker + Docker Compose (v2.24+, for the optional `env_file` entry)
 
 ## Setup
 
-### 1. SSH Key
+### 1. Proxmox: user, role and API token
 
-Ensure your SSH public key is on the Proxmox host:
+Run these once, as root, in a shell on **any one** cluster node. Users, roles
+and ACLs live in `/etc/pve`, so they apply to the whole cluster.
 
 ```bash
-ssh-copy-id root@<proxmox-ip>
+# Role with exactly what the tools need
+pveum role add MCPOperator -privs "\
+Sys.Audit,\
+VM.Audit,VM.PowerMgmt,VM.Snapshot,VM.Clone,VM.Migrate,VM.Allocate,\
+VM.Config.CPU,VM.Config.Memory,VM.Config.Disk,VM.Config.Network,\
+VM.Config.Options,VM.Config.CDROM,VM.Config.HWType,\
+Datastore.Audit,Datastore.AllocateSpace,\
+SDN.Use"
+
+# Dedicated user in the Proxmox realm (no Linux account, no shell)
+pveum user add mcp@pve --comment "Proxmox MCP server"
+
+# Grant the role cluster-wide
+pveum acl modify / --users mcp@pve --roles MCPOperator
+
+# API token; privsep 0 means the token carries the user's permissions
+pveum user token add mcp@pve mcp --privsep 0
+
+# Check the result
+pveum user permissions mcp@pve --path /
 ```
 
-### 2. Configure
+`token add` prints the secret (a UUID) **once**. Save it now.
 
-Create a .env file with your Proxmox SSH details (required — the app will not start without PROXMOX_SSH_HOST):
+| Privilege | Used by |
+|-----------|---------|
+| `Sys.Audit`, `VM.Audit`, `Datastore.Audit` | inspection tools, reading ISOs/templates, other users' tasks |
+| `VM.PowerMgmt` | start / stop / shutdown / reboot |
+| `VM.Snapshot` | snapshots |
+| `VM.Allocate`, `VM.Config.*`, `Datastore.AllocateSpace`, `SDN.Use` | `create_vm`, `create_container` (disks on storage, NIC on `vmbr0`) |
+| `VM.Clone` | `clone_guest` |
+| `VM.Migrate` | `migrate_guest`, `drain_node` |
 
+If a tool fails with `HTTP 403: Permission check failed (/path, Priv.Name)`,
+the message names the missing privilege. Add it with
+`pveum role modify MCPOperator -append 1 -privs Priv.Name`.
+
+To revoke access, run `pveum user token remove mcp@pve mcp`.
+
+### 2. TLS: trust the cluster CA
+
+Each node's API certificate is signed by the cluster's own CA. Copy that CA
+next to the compose file so the certificate can be verified:
+
+```bash
+mkdir -p secrets
+scp root@<proxmox-ip>:/etc/pve/pve-root-ca.pem secrets/pve-root-ca.pem
+```
+
+`secrets/` is gitignored. If you cannot do this, `PROXMOX_TLS_INSECURE=true`
+turns verification off. The server warns at startup when it is set. Don't use
+it on a network you don't trust.
+
+### 3. Configure
+
+`.env` holds the non-secret settings and is tracked in git. The app will not
+start without `PROXMOX_HOST`, `PROXMOX_TOKEN_ID` and `PROXMOX_TOKEN_SECRET`.
 
 ```env
-PROXMOX_SSH_HOST=10.0.0.19
-PROXMOX_SSH_USER=root
-PROXMOX_SSH_KEY=~/.ssh/id_rsa
+PROXMOX_HOST=10.0.0.19
+PROXMOX_PORT=8006
+PROXMOX_TOKEN_ID=mcp@pve!mcp
+# Path to the CA from step 2 (the container always uses /secrets/pve-root-ca.pem)
+PROXMOX_CA_CERT=./secrets/pve-root-ca.pem
 MCP_PORT=3000
 
 # Optional but strongly recommended — see Authentication below.
@@ -51,12 +104,43 @@ PROXMOX_NODE=pve
 PROXMOX_NO_MIGRATE_TAG=dont-move
 ```
 
+Put the token secret in **`.env.local`**, which is gitignored. Never put it in `.env`:
+
+```env
+PROXMOX_TOKEN_SECRET=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+```
+
+Both `npm run dev`/`start` and `docker compose` read `.env.local`.
+
+Check the token from the MCP host before starting the server:
+
+```bash
+curl --cacert secrets/pve-root-ca.pem \
+  -H 'Authorization: PVEAPIToken=mcp@pve!mcp=<secret>' \
+  https://10.0.0.19:8006/api2/json/cluster/resources
+```
+
+#### Migrating from the SSH version
+
+Earlier versions logged in as `root` over SSH and ran `pvesh`. After the API
+version is working, remove the MCP host's public key from
+`/root/.ssh/authorized_keys` on the Proxmox node.
+
+**Delete only that one line.** On a cluster this file is a symlink to
+`/etc/pve/priv/authorized_keys` and also holds the keys the nodes use to reach
+each other. Removing those breaks migration and replication. Find the line by
+the key's comment (e.g. `you@your-mac`) or its fingerprint
+(`ssh-keygen -lf ~/.ssh/id_rsa.pub`).
+
+The old `PROXMOX_SSH_HOST` / `PROXMOX_SSH_USER` / `PROXMOX_SSH_KEY` variables
+are no longer read.
+
 `MCP_PORT` is the **host** port; the container always listens on 3000 internally.
 
 #### Updating a host with local .env changes
 
 `.env` is **tracked in git**, so each host that customises it (a different
-`PROXMOX_SSH_HOST`, say) carries a permanent local modification. When a commit
+`PROXMOX_HOST`, say) carries a permanent local modification. When a commit
 changes `.env`, `git pull` on that host refuses rather than clobber it:
 
 ```
@@ -80,7 +164,7 @@ edits a line a host has customised, `git stash pop` reports a conflict in
 `git status` will keep showing `.env` as modified on that host. That is the
 steady state, and the trade-off of keeping `.env` in version control.
 
-### 3. Authentication
+### 4. Authentication
 
 `/mcp` is protected by a shared-secret Bearer token. Set `MCP_AUTH_TOKEN` and
 every request must carry `Authorization: Bearer <token>`; anything else gets a
@@ -95,7 +179,7 @@ you do not trust.
 `/health` is deliberately left open so orchestrators can probe it without
 credentials.
 
-### 4. Run
+### 5. Run
 
 ```bash
 docker compose up -d
@@ -108,7 +192,7 @@ curl http://localhost:3000/health
 # {"status":"ok","service":"proxmox-mcp"}
 ```
 
-### 5. Connect MCP Client
+### 6. Connect MCP Client
 
 **Cline / VS Code** and **Claude Desktop** use the same shape:
 

@@ -1,7 +1,7 @@
 {
   "name": "proxmox-mcp",
   "version": "1.0.0",
-  "description": "MCP server for Proxmox VE management via SSH + pvesh",
+  "description": "MCP server for Proxmox VE management via the Proxmox VE API",
   "type": "module",
   "scripts": {
     "build": "tsc",

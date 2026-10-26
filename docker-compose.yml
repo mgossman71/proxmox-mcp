@@ -5,11 +5,20 @@ services:
     ports:
       - "${MCP_PORT}:3000"
     volumes:
-      - ~/.ssh/id_rsa:/secrets/id_rsa:ro
+      # Proxmox cluster CA (copied from /etc/pve/pve-root-ca.pem) so the API
+      # certificate can be verified.
+      - ./secrets/pve-root-ca.pem:/secrets/pve-root-ca.pem:ro
+    # Untracked secrets (PROXMOX_TOKEN_SECRET). Values listed under
+    # `environment` take precedence, so the secret is deliberately not there.
+    env_file:
+      - path: .env.local
+        required: false
     environment:
-      PROXMOX_SSH_HOST: ${PROXMOX_SSH_HOST}
-      PROXMOX_SSH_USER: ${PROXMOX_SSH_USER:-root}
-      PROXMOX_SSH_KEY: /secrets/id_rsa
+      PROXMOX_HOST: ${PROXMOX_HOST}
+      PROXMOX_PORT: ${PROXMOX_PORT:-8006}
+      PROXMOX_TOKEN_ID: ${PROXMOX_TOKEN_ID}
+      PROXMOX_CA_CERT: /secrets/pve-root-ca.pem
+      PROXMOX_TLS_INSECURE: ${PROXMOX_TLS_INSECURE:-false}
       MCP_AUTH_TOKEN: ${MCP_AUTH_TOKEN:-}
       PROXMOX_NODE: ${PROXMOX_NODE:-pve}
       PROXMOX_NO_MIGRATE_TAG: ${PROXMOX_NO_MIGRATE_TAG:-}
