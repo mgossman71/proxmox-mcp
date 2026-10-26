@@ -100,6 +100,59 @@ export function registerInspectionTools(server: McpServer): void {
     }
   );
 
+  // get_guest_filesystems
+  server.registerTool(
+    "get_guest_filesystems",
+    {
+      title: "Get Guest Filesystems",
+      description:
+        "Get filesystem usage from inside a running VM or container (auto-detects type). " +
+        "QEMU VMs report every mounted filesystem via the QEMU guest agent, which must be installed and enabled (agent=1). " +
+        "LXC containers report root filesystem usage only.",
+      inputSchema: {
+        node: nodeParam,
+        vmid: vmidParam,
+      },
+    },
+    async ({ node, vmid }) => {
+      const { node: guestNode, type } = await resolveGuest(node, vmid);
+      const base = `/nodes/${guestNode}/${type}/${vmid}`;
+
+      let filesystems: Record<string, any>[];
+      if (type === "qemu") {
+        let data: any;
+        try {
+          data = await pvesh("get", `${base}/agent/get-fsinfo`);
+        } catch (e: any) {
+          throw new ProxmoxError(
+            `Could not query the guest agent for VMID ${vmid}: ${e.message}. ` +
+              "The VM must be running, have qemu-guest-agent installed and running, and have agent=1 in its config."
+          );
+        }
+        const result: any[] = Array.isArray(data?.result) ? data.result : [];
+        filesystems = result
+          // Skip pseudo filesystems (proc, sysfs...), which report no size
+          .filter((fs) => typeof fs["total-bytes"] === "number")
+          .map((fs) => usage(fs.mountpoint, fs.type, fs["total-bytes"], fs["used-bytes"]));
+      } else {
+        const status: any = await pvesh("get", `${base}/status/current`);
+        if (status?.status !== "running") {
+          throw new ProxmoxError(`Container ${vmid} is not running; filesystem usage is only reported while it runs.`);
+        }
+        filesystems = [usage("/", "rootfs", status.maxdisk, status.disk)];
+      }
+
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify({ vmid, node: guestNode, type, filesystems }, null, 2),
+          },
+        ],
+      };
+    }
+  );
+
   // list_storage
   server.registerTool(
     "list_storage",
@@ -210,4 +263,20 @@ export function registerInspectionTools(server: McpServer): void {
       return { content: [{ type: "text" as const, text: JSON.stringify(tasks, null, 2) }] };
     }
   );
+}
+/** One filesystem's usage, with free space and percentage derived. */
+function usage(
+  mountpoint: string,
+  fsType: string,
+  totalBytes: number,
+  usedBytes: number
+): Record<string, any> {
+  return {
+    mountpoint,
+    type: fsType,
+    total_bytes: totalBytes,
+    used_bytes: usedBytes,
+    free_bytes: totalBytes - usedBytes,
+    used_percent: totalBytes > 0 ? Math.round((usedBytes / totalBytes) * 1000) / 10 : null,
+  };
 }
