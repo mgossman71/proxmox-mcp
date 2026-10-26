@@ -9,7 +9,7 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { createServer } from "./server.js";
 import { bearerAuth } from "./auth.js";
 import { noMigrateTag } from "./tools/migration.js";
-import { apiBaseUrl, tlsInsecure } from "./proxmox.js";
+import { apiHosts, tlsInsecure } from "./proxmox.js";
 
 const PORT = parseInt(process.env.MCP_PORT || "3000", 10);
 // Shared-secret auth for /mcp. When unset, requests are allowed (a warning is
@@ -90,7 +90,7 @@ app.listen(PORT, () => {
   console.log(`Proxmox MCP server listening on http://0.0.0.0:${PORT}`);
   console.log(`  MCP endpoint:   http://0.0.0.0:${PORT}/mcp`);
   console.log(`  Health check:   http://0.0.0.0:${PORT}/health`);
-  console.log(`  Proxmox API:    ${apiBaseUrl()} (token ${process.env.PROXMOX_TOKEN_ID})`);
+  console.log(`  Proxmox API:    ${apiHosts().join(", ")} port ${process.env.PROXMOX_PORT || "8006"} (token ${process.env.PROXMOX_TOKEN_ID})`);
   console.log(`  Default node:   ${process.env.PROXMOX_NODE || "pve"}`);
   console.log(`  No-migrate tag: ${noMigrateTag()} (case-insensitive)`);
   // Fail-loud about missing configuration.

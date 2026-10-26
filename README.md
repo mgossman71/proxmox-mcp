@@ -88,8 +88,9 @@ it on a network you don't trust.
 start without `PROXMOX_HOST`, `PROXMOX_TOKEN_ID` and `PROXMOX_TOKEN_SECRET`.
 
 ```env
-# Any node of the cluster; it proxies requests for the other nodes
-PROXMOX_HOST=10.0.0.22
+# One or more cluster nodes, comma-separated. Any node serves the whole
+# cluster's API; the extra entries are only used for failover.
+PROXMOX_HOST=10.0.0.22,10.0.0.20,10.0.0.21
 PROXMOX_PORT=8006
 PROXMOX_TOKEN_ID=mcp@pve!mcp
 # Path to the CA from step 2 (the container always uses /secrets/pve-root-ca.pem)
@@ -104,6 +105,14 @@ PROXMOX_NODE=pve
 # than disabling the protection.
 PROXMOX_NO_MIGRATE_TAG=dont-move
 ```
+
+With several hosts, the server tries the one that last answered first. It
+moves on to the next host when one can't be reached, giving each 5 seconds to
+connect. A read is also retried when the connection drops mid-request. A
+write (create, start, migrate...) is not retried once it has connected,
+because the first node may already have acted on it. HTTP errors such as 401
+or 403 come from Proxmox itself and are never retried. Every node shares the
+same `pve-root-ca.pem`, so one CA file covers them all.
 
 Secrets go in **`.env.local`**, which is gitignored. Never put them in `.env`.
 Both `npm run dev`/`start` and `docker compose` read it.
