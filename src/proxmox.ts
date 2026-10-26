@@ -1,14 +1,6 @@
-import { execFile } from "child_process";
-import { promisify } from "util";
+import https from "https";
+import fs from "fs";
 import os from "os";
-
-const execFileAsync = promisify(execFile);
-
-const SSH_HOST = process.env.PROXMOX_SSH_HOST;
-const SSH_USER = process.env.PROXMOX_SSH_USER || "root";
-const SSH_KEY = expandHome(
-  process.env.PROXMOX_SSH_KEY || "~/.ssh/id_rsa"
-);
 
 export function expandHome(path: string): string {
   if (path.startsWith("~")) {
@@ -29,11 +21,11 @@ export class ProxmoxError extends Error {
 }
 
 /**
- * Error raised when a pvesh response cannot be parsed into JSON.
+ * Error raised when a Proxmox API response cannot be parsed into JSON.
  *
  * Kept as a distinct subclass (rather than matching on the message string) so
  * callers such as `waitForTask` can reliably tell a transient parse hiccup
- * apart from a genuine Proxmox/SSH failure.
+ * apart from a genuine Proxmox/API failure.
  */
 export class ProxmoxParseError extends ProxmoxError {
   constructor(message: string) {
@@ -44,63 +36,104 @@ export class ProxmoxParseError extends ProxmoxError {
 
 /**
  * Shape of the value returned by {@link pvesh}: a parsed JSON object or array,
- * a raw UPID/progress string, or `null` when the command produced no output.
+ * a UPID string, or `null` when the API returned no data.
  */
 export type PveshResult = Record<string, any> | any[] | string | null;
 
-/**
- * Run a command on the Proxmox host via SSH.
- */
-async function ssh(remoteCmd: string, timeoutMs = 60000): Promise<string> {
-  // Reuse a single multiplexed SSH connection across calls (ControlMaster).
-  // This avoids re-establishing the TCP + auth handshake for every pvesh call,
-  // which matters for compound operations (e.g. list_isos over N storages).
-  // ControlPersist keeps the master connection alive briefly between requests.
-  const controlPath = `${os.tmpdir()}/proxmox-mcp-ssh-%r@%h:%p`;
-  const args = [
-    "-o", "BatchMode=yes",
-    // accept-new: trust the host key on first contact, then pin it — avoids the
-    // silent MITM exposure of "no" while still working for brand-new hosts.
-    "-o", "StrictHostKeyChecking=accept-new",
-    "-o", "ConnectTimeout=10",
-    "-o", "ControlMaster=auto",
-    "-o", `ControlPath=${controlPath}`,
-    "-o", "ControlPersist=300",
-    "-i", SSH_KEY,
-    `${SSH_USER}@${SSH_HOST}`,
-    remoteCmd,
-  ];
+/** True when TLS certificate verification has been explicitly disabled. */
+export function tlsInsecure(): boolean {
+  return process.env.PROXMOX_TLS_INSECURE?.toLowerCase() === "true";
+}
 
-  try {
-    const { stdout } = await execFileAsync("ssh", args, {
-      timeout: timeoutMs,
-      maxBuffer: 10 * 1024 * 1024,
+/** Base URL of the Proxmox API, e.g. `https://10.0.0.19:8006/api2/json`. */
+export function apiBaseUrl(): string {
+  const port = process.env.PROXMOX_PORT || "8006";
+  return `https://${process.env.PROXMOX_HOST}:${port}/api2/json`;
+}
+
+// One keep-alive agent for every request. This reuses the TLS connection
+// across calls, which matters for compound operations (e.g. list_isos over N
+// storages). Built lazily so configuration is read after dotenv has loaded.
+let agent: https.Agent | undefined;
+
+function getAgent(): https.Agent {
+  if (!agent) {
+    const caPath = process.env.PROXMOX_CA_CERT;
+    agent = new https.Agent({
+      keepAlive: true,
+      ca: caPath ? fs.readFileSync(expandHome(caPath)) : undefined,
+      rejectUnauthorized: !tlsInsecure(),
     });
-    return stdout.trim();
-  } catch (error: any) {
-    const stderr = error.stderr?.trim() || error.message || "Unknown SSH error";
-    throw new ProxmoxError(
-      `SSH command failed (exit ${error.code ?? "?"}): ${stderr}`,
-      error.code ?? 1,
-      stderr
-    );
   }
+  return agent;
+}
+
+interface HttpResponse {
+  status: number;
+  statusText: string;
+  body: string;
 }
 
 /**
- * Shell-quote a string for safe use in a remote shell command.
+ * Send one HTTPS request to the Proxmox API.
  */
-function q(s: string): string {
-  return `'${s.replace(/'/g, `'\\''`)}'`;
+function request(
+  method: string,
+  url: string,
+  body: string | undefined,
+  timeoutMs: number
+): Promise<HttpResponse> {
+  const headers: Record<string, string> = {
+    Authorization: `PVEAPIToken=${process.env.PROXMOX_TOKEN_ID}=${process.env.PROXMOX_TOKEN_SECRET}`,
+  };
+  if (body !== undefined) {
+    headers["Content-Type"] = "application/x-www-form-urlencoded";
+    headers["Content-Length"] = String(Buffer.byteLength(body));
+  }
+
+  return new Promise((resolve, reject) => {
+    const req = https.request(
+      url,
+      { method, headers, agent: getAgent(), timeout: timeoutMs },
+      (res) => {
+        const chunks: Buffer[] = [];
+        res.on("data", (chunk: Buffer) => chunks.push(chunk));
+        res.on("end", () =>
+          resolve({
+            status: res.statusCode ?? 0,
+            statusText: res.statusMessage ?? "",
+            body: Buffer.concat(chunks).toString("utf8"),
+          })
+        );
+        res.on("error", reject);
+      }
+    );
+    req.on("timeout", () =>
+      req.destroy(new Error(`Request timed out after ${timeoutMs} ms`))
+    );
+    req.on("error", reject);
+    if (body !== undefined) req.write(body);
+    req.end();
+  });
 }
 
+const HTTP_METHODS = {
+  get: "GET",
+  create: "POST",
+  set: "PUT",
+  delete: "DELETE",
+} as const;
+
 /**
- * Run a pvesh command on the Proxmox host.
+ * Call the Proxmox VE REST API.
+ *
+ * Keeps the `pvesh` verb names (get/create/set/delete) so call sites read the
+ * same as the Proxmox CLI docs; they map to GET/POST/PUT/DELETE.
  *
  * @param method  - pvesh method: get, create, set, delete
  * @param path    - API path (e.g. /nodes/pve/qemu/100/config)
  * @param params  - key-value parameters (e.g. { name: "MyVM", cores: 2 })
- * @returns parsed JSON response, or null if empty
+ * @returns the response's `data` field, or null if there is none
  */
 export async function pvesh(
   method: "get" | "create" | "set" | "delete",
@@ -108,47 +141,53 @@ export async function pvesh(
   params: Record<string, string | number | boolean> = {},
   timeoutMs = 60000
 ): Promise<PveshResult> {
-  let cmd = `pvesh ${method} ${path}`;
-
+  const form = new URLSearchParams();
   for (const [key, value] of Object.entries(params)) {
-    if (typeof value === "boolean") {
-      if (value) cmd += ` --${key} 1`;
-    } else {
-      cmd += ` --${key} ${q(String(value))}`;
-    }
+    form.append(key, typeof value === "boolean" ? (value ? "1" : "0") : String(value));
+  }
+  const encoded = form.toString();
+
+  const httpMethod = HTTP_METHODS[method];
+  const hasBody = httpMethod === "POST" || httpMethod === "PUT";
+  let url = `${apiBaseUrl()}${path}`;
+  if (!hasBody && encoded) url += `?${encoded}`;
+
+  let res: HttpResponse;
+  try {
+    res = await request(httpMethod, url, hasBody ? encoded : undefined, timeoutMs);
+  } catch (error: any) {
+    const message = error?.message || "Unknown network error";
+    throw new ProxmoxError(`Proxmox API request failed: ${message}`, 1, message);
   }
 
-  cmd += " --output-format json";
-
-  const output = await ssh(cmd, timeoutMs);
-
-  if (!output) return null;
-
-  try {
-    return JSON.parse(output);
-  } catch {
-    // pvesh may return multi-line output with progress messages
-    // followed by a UPID on the last line. Extract it.
-    const lines = output.split("\n").filter((l) => l.trim());
-    const lastLine = lines[lines.length - 1]?.trim();
-
-    if (lastLine && lastLine.startsWith("UPID:")) {
-      return lastLine;
-    }
-
-    // Check if any line is valid JSON (e.g., JSON followed by extra output)
-    for (const line of lines) {
-      try {
-        return JSON.parse(line);
-      } catch {
-        continue;
-      }
-    }
-
-    throw new ProxmoxParseError(
-      `Failed to parse pvesh response: ${output}`
+  if (res.status < 200 || res.status >= 300) {
+    // PVE puts the human-readable reason in the status line (e.g. "Permission
+    // check failed (/vms/100, VM.Audit)") and per-parameter problems in
+    // `errors`. Keep the status code in the text: isEndpointMissing() matches
+    // on "501".
+    let detail = "";
+    try {
+      const errors = JSON.parse(res.body)?.errors;
+      if (errors) detail = ` ${JSON.stringify(errors)}`;
+    } catch { /* non-JSON error body */ }
+    throw new ProxmoxError(
+      `HTTP ${res.status}: ${res.statusText}${detail}`,
+      res.status,
+      res.body
     );
   }
+
+  if (!res.body) return null;
+
+  let parsed: any;
+  try {
+    parsed = JSON.parse(res.body);
+  } catch {
+    throw new ProxmoxParseError(
+      `Failed to parse Proxmox API response: ${res.body}`
+    );
+  }
+  return parsed?.data ?? null;
 }
 
 /**
@@ -283,7 +322,7 @@ export async function waitForTask(
   while (Date.now() - startTime < timeoutMs) {
     try {
       const status = asObject(
-        await pvesh("get", `/nodes/${node}/tasks/${upid}/status`)
+        await pvesh("get", `/nodes/${node}/tasks/${encodeURIComponent(upid)}/status`)
       );
       if (status && status.status === "stopped") {
         if (status.exitstatus === "OK") {
@@ -292,9 +331,12 @@ export async function waitForTask(
         // Task failed — try to get the log for the actual error message
         let detail = `exitstatus=${status.exitstatus}`;
         try {
-          const log = await pvesh("get", `/nodes/${node}/tasks/${upid}/log`);
+          const log = await pvesh("get", `/nodes/${node}/tasks/${encodeURIComponent(upid)}/log`);
           if (log != null) {
-            const lines: any[] = Array.isArray(log) ? log : [log];
+            // The API returns log lines as { n: lineNo, t: text }
+            const lines: any[] = (Array.isArray(log) ? log : [log]).map(
+              (l: any) => (typeof l === "object" && l !== null && "t" in l ? l.t : l)
+            );
             // Take the last few lines as they usually contain the error
             const tail = lines.slice(-5).join("\n");
             if (tail) detail = tail;
