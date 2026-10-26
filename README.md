@@ -26,14 +26,15 @@ Run these once, as root, in a shell on **any one** cluster node. Users, roles
 and ACLs live in `/etc/pve`, so they apply to the whole cluster.
 
 ```bash
-# Role with exactly what the tools need
-pveum role add MCPOperator -privs "\
-Sys.Audit,\
-VM.Audit,VM.PowerMgmt,VM.Snapshot,VM.Clone,VM.Migrate,VM.Allocate,\
-VM.Config.CPU,VM.Config.Memory,VM.Config.Disk,VM.Config.Network,\
-VM.Config.Options,VM.Config.CDROM,VM.Config.HWType,\
-Datastore.Audit,Datastore.AllocateSpace,\
-SDN.Use"
+# Role with exactly what the tools need. Built up in short lines so a wrapped
+# paste can't split a privilege name in two.
+P="Sys.Audit,VM.Audit,VM.PowerMgmt,VM.Snapshot"
+P="$P,VM.Clone,VM.Migrate,VM.Allocate"
+P="$P,VM.Config.CPU,VM.Config.Memory,VM.Config.Disk"
+P="$P,VM.Config.Network,VM.Config.Options"
+P="$P,VM.Config.CDROM,VM.Config.HWType"
+P="$P,Datastore.Audit,Datastore.AllocateSpace,SDN.Use"
+pveum role add MCPOperator -privs "$P"
 
 # Dedicated user in the Proxmox realm (no Linux account, no shell)
 pveum user add mcp@pve --comment "Proxmox MCP server"
@@ -41,14 +42,12 @@ pveum user add mcp@pve --comment "Proxmox MCP server"
 # Grant the role cluster-wide
 pveum acl modify / --users mcp@pve --roles MCPOperator
 
-# API token; privsep 0 means the token carries the user's permissions
-pveum user token add mcp@pve mcp --privsep 0
-
 # Check the result
 pveum user permissions mcp@pve --path /
 ```
 
-`token add` prints the secret (a UUID) **once**. Save it now.
+The token itself is created in step 3, from the MCP host, so its secret goes
+straight into `.env.local` without being copied by hand.
 
 | Privilege | Used by |
 |-----------|---------|
@@ -67,12 +66,14 @@ To revoke access, run `pveum user token remove mcp@pve mcp`.
 
 ### 2. TLS: trust the cluster CA
 
-Each node's API certificate is signed by the cluster's own CA. Copy that CA
-next to the compose file so the certificate can be verified:
+Each node's API certificate is signed by the cluster's own CA. On the MCP
+host, copy that CA next to the compose file so the certificate can be verified.
+Copy it from a node **in the same cluster as `PROXMOX_HOST`**; a CA from any
+other Proxmox system makes every request fail with curl status `000`.
 
 ```bash
 mkdir -p secrets
-scp root@<proxmox-ip>:/etc/pve/pve-root-ca.pem secrets/pve-root-ca.pem
+scp root@10.0.0.22:/etc/pve/pve-root-ca.pem secrets/pve-root-ca.pem
 ```
 
 `secrets/` is gitignored. If you cannot do this, `PROXMOX_TLS_INSECURE=true`
@@ -85,15 +86,13 @@ it on a network you don't trust.
 start without `PROXMOX_HOST`, `PROXMOX_TOKEN_ID` and `PROXMOX_TOKEN_SECRET`.
 
 ```env
-PROXMOX_HOST=10.0.0.19
+# Any node of the cluster; it proxies requests for the other nodes
+PROXMOX_HOST=10.0.0.22
 PROXMOX_PORT=8006
 PROXMOX_TOKEN_ID=mcp@pve!mcp
 # Path to the CA from step 2 (the container always uses /secrets/pve-root-ca.pem)
 PROXMOX_CA_CERT=./secrets/pve-root-ca.pem
 MCP_PORT=3000
-
-# Optional but strongly recommended — see Authentication below.
-MCP_AUTH_TOKEN=some-long-random-string
 
 # Default node for tools called without an explicit `node` (default: pve).
 PROXMOX_NODE=pve
@@ -104,21 +103,40 @@ PROXMOX_NODE=pve
 PROXMOX_NO_MIGRATE_TAG=dont-move
 ```
 
-Put the token secret in **`.env.local`**, which is gitignored. Never put it in `.env`:
+Secrets go in **`.env.local`**, which is gitignored. Never put them in `.env`.
+Both `npm run dev`/`start` and `docker compose` read it.
 
-```env
-PROXMOX_TOKEN_SECRET=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
-```
-
-Both `npm run dev`/`start` and `docker compose` read `.env.local`.
-
-Check the token from the MCP host before starting the server:
+On the MCP host, create the API token on the node and write its secret and an
+MCP auth token into `.env.local` in one go. This needs root SSH to the node one
+last time, and re-running it replaces the token:
 
 ```bash
-curl --cacert secrets/pve-root-ca.pem \
-  -H 'Authorization: PVEAPIToken=mcp@pve!mcp=<secret>' \
-  https://10.0.0.19:8006/api2/json/cluster/resources
+set +H   # the token id contains '!', which bash would otherwise try to expand
+SECRET=$(ssh root@10.0.0.22 "pveum user token remove mcp@pve mcp 2>/dev/null; pveum user token add mcp@pve mcp --privsep 0 --output-format json" \
+  | perl -MJSON::PP -0ne 'print decode_json($_)->{value}')
+echo "length: ${#SECRET}"   # expect 36
+printf 'PROXMOX_TOKEN_SECRET=%s\nMCP_AUTH_TOKEN=%s\n' "$SECRET" "$(openssl rand -hex 32)" > .env.local
+chmod 600 .env.local
 ```
+
+To rotate only the Proxmox token later, keep the existing `MCP_AUTH_TOKEN`:
+run the `SECRET=` line again, then
+`sed -i "s/^PROXMOX_TOKEN_SECRET=.*/PROXMOX_TOKEN_SECRET=$SECRET/" .env.local`.
+
+Check the token before starting the server. It should print `200`:
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' --cacert secrets/pve-root-ca.pem \
+  -H "Authorization: PVEAPIToken=mcp@pve!mcp=$SECRET" \
+  https://10.0.0.22:8006/api2/json/nodes
+```
+
+| Result | Cause |
+|--------|-------|
+| `200` | Token and certificate are good |
+| `401` | Secret doesn't match the current token, or `PROXMOX_HOST` is not in the cluster the token was made in |
+| `000` | Connection or TLS failure; usually `pve-root-ca.pem` came from a different system |
+| `bash: !mcp: event not found` | Run `set +H` first, or single-quote the header |
 
 #### Migrating from the SSH version
 
@@ -166,8 +184,8 @@ steady state, and the trade-off of keeping `.env` in version control.
 
 ### 4. Authentication
 
-`/mcp` is protected by a shared-secret Bearer token. Set `MCP_AUTH_TOKEN` and
-every request must carry `Authorization: Bearer <token>`; anything else gets a
+`/mcp` is protected by a shared-secret Bearer token. Set `MCP_AUTH_TOKEN` in
+`.env.local` (step 3 does this) and every request must carry `Authorization: Bearer <token>`; anything else gets a
 401.
 
 **If `MCP_AUTH_TOKEN` is unset the endpoint is completely unauthenticated** —
@@ -182,15 +200,26 @@ credentials.
 ### 5. Run
 
 ```bash
-docker compose up -d
+docker compose up -d --build
 ```
+
+After changing `.env` or `.env.local`, run `docker compose up -d --force-recreate`
+so the container picks up the new values.
 
 Verify:
 
 ```bash
 curl http://localhost:3000/health
 # {"status":"ok","service":"proxmox-mcp"}
+
+# Real API call through the server's own client; lists every node
+docker compose exec proxmox-mcp node --input-type=module -e '
+const p = await import("/app/dist/proxmox.js");
+console.log((await p.pvesh("get", "/nodes")).map(n => `${n.node}: ${n.status}`).join("\n"));'
 ```
+
+`/health` does not touch Proxmox, so a green health check alone does not prove
+the token works.
 
 ### 6. Connect MCP Client
 
