@@ -45,11 +45,38 @@ export function tlsInsecure(): boolean {
   return process.env.PROXMOX_TLS_INSECURE?.toLowerCase() === "true";
 }
 
-/** Base URL of the Proxmox API, e.g. `https://10.0.0.19:8006/api2/json`. */
-export function apiBaseUrl(): string {
-  const port = process.env.PROXMOX_PORT || "8006";
-  return `https://${process.env.PROXMOX_HOST}:${port}/api2/json`;
+/**
+ * Cluster nodes to talk to, from the comma-separated `PROXMOX_HOST`. Any node
+ * serves the whole cluster's API, so the extra entries are only for failover.
+ */
+export function apiHosts(): string[] {
+  return (process.env.PROXMOX_HOST || "")
+    .split(",")
+    .map((h) => h.trim())
+    .filter(Boolean);
 }
+
+/** Base URL of one node's API, e.g. `https://10.0.0.22:8006/api2/json`. */
+export function apiBaseUrl(host = apiHosts()[0]): string {
+  const port = process.env.PROXMOX_PORT || "8006";
+  return `https://${host}:${port}/api2/json`;
+}
+
+// The host that last answered. Tried first, so after a failover every request
+// does not pay for the dead node's connect timeout again.
+let preferredHost: string | undefined;
+
+/** Hosts in the order to try them: the last one that worked, then the rest. */
+function hostOrder(): string[] {
+  const hosts = apiHosts();
+  if (preferredHost && hosts.includes(preferredHost)) {
+    return [preferredHost, ...hosts.filter((h) => h !== preferredHost)];
+  }
+  return hosts;
+}
+
+/** How long to wait for a TCP + TLS connection before trying the next host. */
+const CONNECT_TIMEOUT_MS = 5000;
 
 // One keep-alive agent for every request. This reuses the TLS connection
 // across calls, which matters for compound operations (e.g. list_isos over N
@@ -73,6 +100,12 @@ interface HttpResponse {
   statusText: string;
   body: string;
 }
+
+/**
+ * A failed request. `connected` is true when the connection to the node was
+ * established, i.e. the request may have reached it and run.
+ */
+type RequestError = Error & { connected?: boolean };
 
 /**
  * Send one HTTPS request to the Proxmox API.
@@ -108,10 +141,30 @@ function request(
         res.on("error", reject);
       }
     );
+    let connected = false;
+    req.on("socket", (socket: any) => {
+      // A reused keep-alive socket is already connected
+      if (!socket.connecting) {
+        connected = true;
+        return;
+      }
+      const timer = setTimeout(
+        () => req.destroy(new Error(`Connection timed out after ${CONNECT_TIMEOUT_MS} ms`)),
+        CONNECT_TIMEOUT_MS
+      );
+      socket.once("secureConnect", () => {
+        connected = true;
+        clearTimeout(timer);
+      });
+      socket.once("close", () => clearTimeout(timer));
+    });
     req.on("timeout", () =>
       req.destroy(new Error(`Request timed out after ${timeoutMs} ms`))
     );
-    req.on("error", reject);
+    req.on("error", (err: RequestError) => {
+      err.connected = connected;
+      reject(err);
+    });
     if (body !== undefined) req.write(body);
     req.end();
   });
@@ -149,14 +202,30 @@ export async function pvesh(
 
   const httpMethod = HTTP_METHODS[method];
   const hasBody = httpMethod === "POST" || httpMethod === "PUT";
-  let url = `${apiBaseUrl()}${path}`;
-  if (!hasBody && encoded) url += `?${encoded}`;
+  const query = !hasBody && encoded ? `?${encoded}` : "";
 
-  let res: HttpResponse;
-  try {
-    res = await request(httpMethod, url, hasBody ? encoded : undefined, timeoutMs);
-  } catch (error: any) {
-    const message = error?.message || "Unknown network error";
+  // Try each node in turn. A read can always move on to the next node. A write
+  // only moves on when it never connected: once it has, the node may already
+  // have acted on it, and sending it again elsewhere could run it twice.
+  let res: HttpResponse | undefined;
+  const failures: string[] = [];
+  for (const host of hostOrder()) {
+    try {
+      res = await request(
+        httpMethod,
+        `${apiBaseUrl(host)}${path}${query}`,
+        hasBody ? encoded : undefined,
+        timeoutMs
+      );
+      preferredHost = host;
+      break;
+    } catch (error: any) {
+      failures.push(`${host}: ${error?.message || "Unknown network error"}`);
+      if (httpMethod !== "GET" && error?.connected) break;
+    }
+  }
+  if (!res) {
+    const message = failures.join("; ") || "PROXMOX_HOST is not set";
     throw new ProxmoxError(`Proxmox API request failed: ${message}`, 1, message);
   }
 

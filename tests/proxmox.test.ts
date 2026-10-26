@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { EventEmitter } from "events";
 import os from "os";
 
@@ -39,7 +39,9 @@ interface CapturedRequest {
   options: any;
 }
 
-type Reply = { status?: number; statusText?: string; body?: string } | Error;
+// An Error reply fails the request; set `afterConnect` on it to fail only once
+// the connection is up (so the request may have reached the node).
+type Reply = { status?: number; statusText?: string; body?: string } | (Error & { afterConnect?: boolean });
 
 let requests: CapturedRequest[] = [];
 
@@ -56,6 +58,7 @@ function mockApi(reply: (req: CapturedRequest) => Reply) {
         requests.push(captured);
         const r = reply(captured);
         if (r instanceof Error) {
+          if (r.afterConnect) req.emit("socket", { connecting: false });
           req.emit("error", r);
           return;
         }
@@ -233,6 +236,73 @@ describe("pvesh", () => {
     const err = await pvesh("get", "/test").catch((e) => e);
     expect(err).toBeInstanceOf(ProxmoxParseError);
     expect(err.message).toContain("Failed to parse Proxmox API response");
+  });
+});
+
+// --- pvesh failover across PROXMOX_HOST entries ---
+
+describe("pvesh failover", () => {
+  afterEach(() => {
+    process.env.PROXMOX_HOST = "pve.test";
+  });
+
+  const refused = (host: string) => new Error(`connect ECONNREFUSED ${host}:8006`);
+  const resetAfterConnect = () => Object.assign(new Error("socket hang up"), { afterConnect: true });
+  const ok = { body: JSON.stringify({ data: "ok" }) };
+
+  it("should move on to the next host when one is unreachable", async () => {
+    process.env.PROXMOX_HOST = "a1, b1";
+    mockApi((req) => (req.url.includes("//a1:") ? refused("a1") : ok));
+    expect(await pvesh("get", "/version")).toBe("ok");
+    expect(requests.map((r) => r.url)).toEqual([
+      "https://a1:8006/api2/json/version",
+      "https://b1:8006/api2/json/version",
+    ]);
+  });
+
+  it("should keep using the host that answered", async () => {
+    process.env.PROXMOX_HOST = "a2,b2";
+    mockApi((req) => (req.url.includes("//a2:") ? refused("a2") : ok));
+    await pvesh("get", "/version");
+    requests = [];
+    await pvesh("get", "/version");
+    expect(requests.map((r) => r.url)).toEqual(["https://b2:8006/api2/json/version"]);
+  });
+
+  it("should retry a write that never connected", async () => {
+    process.env.PROXMOX_HOST = "a3,b3";
+    mockApi((req) => (req.url.includes("//a3:") ? refused("a3") : ok));
+    expect(await pvesh("create", "/nodes/pve/qemu/100/status/start")).toBe("ok");
+    expect(requests).toHaveLength(2);
+  });
+
+  it("should not resend a write once it reached a node", async () => {
+    process.env.PROXMOX_HOST = "a4,b4";
+    mockApi((req) => (req.url.includes("//a4:") ? resetAfterConnect() : ok));
+    await expect(pvesh("create", "/nodes/pve/qemu/100/status/start")).rejects.toThrow("a4: socket hang up");
+    expect(requests).toHaveLength(1);
+  });
+
+  it("should retry a read even after it connected", async () => {
+    process.env.PROXMOX_HOST = "a5,b5";
+    mockApi((req) => (req.url.includes("//a5:") ? resetAfterConnect() : ok));
+    expect(await pvesh("get", "/version")).toBe("ok");
+    expect(requests).toHaveLength(2);
+  });
+
+  it("should not fail over on an HTTP error", async () => {
+    process.env.PROXMOX_HOST = "a6,b6";
+    mockApi(() => ({ status: 403, statusText: "Permission check failed" }));
+    await expect(pvesh("get", "/version")).rejects.toThrow("HTTP 403");
+    expect(requests).toHaveLength(1);
+  });
+
+  it("should report every host when all fail", async () => {
+    process.env.PROXMOX_HOST = "a7,b7";
+    mockApi((req) => refused(req.url.includes("//a7:") ? "a7" : "b7"));
+    await expect(pvesh("get", "/version")).rejects.toThrow(
+      "Proxmox API request failed: a7: connect ECONNREFUSED a7:8006; b7: connect ECONNREFUSED b7:8006"
+    );
   });
 });
 
