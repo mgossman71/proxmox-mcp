@@ -85,9 +85,10 @@ describe("inspection tools", () => {
     registerInspectionTools(server);
   });
 
-  it("should register all 11 inspection tools", () => {
+  it("should register all 12 inspection tools", () => {
     expect(Object.keys(server.tools).sort()).toEqual([
       "get_guest_config",
+      "get_guest_filesystems",
       "get_guest_status",
       "list_containers",
       "list_isos",
@@ -199,6 +200,59 @@ describe("inspection tools", () => {
       mockPvesh.mockRejectedValue(new Error("not found"));
       mockGetGuestInfo.mockRejectedValue(new Error("VMID 999 not found in cluster"));
       await expect(server.tools["get_guest_status"]({ node: "pve", vmid: 999 })).rejects.toThrow();
+    });
+  });
+
+  describe("get_guest_filesystems", () => {
+    it("should report QEMU filesystems from the guest agent, skipping pseudo filesystems", async () => {
+      mockPvesh
+        .mockResolvedValueOnce({ status: "running" }) // resolveGuest qemu check
+        .mockResolvedValueOnce({
+          result: [
+            { mountpoint: "/", type: "ext4", "total-bytes": 1000, "used-bytes": 250 },
+            { mountpoint: "/proc", type: "proc" },
+            { mountpoint: "/data", type: "xfs", "total-bytes": 0, "used-bytes": 0 },
+          ],
+        });
+      const result = await server.tools["get_guest_filesystems"]({ node: "pve", vmid: 100 });
+      expect(mockPvesh).toHaveBeenCalledWith("get", "/nodes/pve/qemu/100/agent/get-fsinfo");
+      const body = JSON.parse(result.content[0].text);
+      expect(body).toMatchObject({ vmid: 100, node: "pve", type: "qemu" });
+      expect(body.filesystems).toEqual([
+        { mountpoint: "/", type: "ext4", total_bytes: 1000, used_bytes: 250, free_bytes: 750, used_percent: 25 },
+        { mountpoint: "/data", type: "xfs", total_bytes: 0, used_bytes: 0, free_bytes: 0, used_percent: null },
+      ]);
+    });
+
+    it("should explain the guest agent requirement when the agent call fails", async () => {
+      mockPvesh
+        .mockResolvedValueOnce({ status: "running" })
+        .mockRejectedValueOnce(new Error("HTTP 500: QEMU guest agent is not running"));
+      await expect(server.tools["get_guest_filesystems"]({ node: "pve", vmid: 100 })).rejects.toThrow(
+        /QEMU guest agent is not running.*qemu-guest-agent installed/
+      );
+    });
+
+    it("should report LXC root filesystem usage from status", async () => {
+      mockPvesh
+        .mockRejectedValueOnce(new Error("not found")) // not qemu
+        .mockResolvedValueOnce({ status: "running" }) // resolveGuest lxc check
+        .mockResolvedValueOnce({ status: "running", disk: 300, maxdisk: 1200 });
+      const result = await server.tools["get_guest_filesystems"]({ node: "pve", vmid: 101 });
+      expect(mockPvesh).toHaveBeenLastCalledWith("get", "/nodes/pve/lxc/101/status/current");
+      const body = JSON.parse(result.content[0].text);
+      expect(body.type).toBe("lxc");
+      expect(body.filesystems).toEqual([
+        { mountpoint: "/", type: "rootfs", total_bytes: 1200, used_bytes: 300, free_bytes: 900, used_percent: 25 },
+      ]);
+    });
+
+    it("should refuse a stopped LXC container", async () => {
+      mockPvesh
+        .mockRejectedValueOnce(new Error("not found"))
+        .mockResolvedValueOnce({ status: "stopped" })
+        .mockResolvedValueOnce({ status: "stopped", disk: 0, maxdisk: 1200 });
+      await expect(server.tools["get_guest_filesystems"]({ node: "pve", vmid: 101 })).rejects.toThrow("is not running");
     });
   });
 
